@@ -8,6 +8,7 @@ import cv2
 from multiprocessing.managers import SharedMemoryManager
 from umi.real_world.rtde_interpolation_controller import RTDEInterpolationController
 from umi.real_world.wsg_controller import WSGController
+from umi.real_world.robotiq_controller import RobotiqController
 from umi.real_world.franka_interpolation_controller import FrankaInterpolationController
 from umi.real_world.multi_uvc_camera import MultiUvcCamera, VideoRecorder
 from diffusion_policy.common.timestamp_accumulator import (
@@ -37,12 +38,13 @@ class UmiEnv:
             # env params
             frequency=20,
             robot_type='ur5',
+            gripper_type='robotiq',
             # obs
             obs_image_resolution=(224,224),
             max_obs_buffer_size=60,
             obs_float32=False,
             camera_reorder=None,
-            no_mirror=False,
+            no_mirror=True,
             fisheye_converter=None,
             mirror_crop=False,
             mirror_swap=False,
@@ -259,13 +261,18 @@ class UmiEnv:
                 receive_latency=robot_obs_latency
             )
         
-        gripper = WSGController(
-            shm_manager=shm_manager,
-            hostname=gripper_ip,
-            port=gripper_port,
-            receive_latency=gripper_obs_latency,
-            use_meters=True
-        )
+        if gripper_type == 'wsg50':
+            gripper = WSGController(
+                shm_manager=shm_manager,
+                hostname=gripper_ip,
+                port=gripper_port,
+                receive_latency=gripper_obs_latency,
+                use_meters=True
+            )
+        elif gripper_type == 'robotiq':
+            gripper = RobotiqController(
+                shm_manager=shm_manager,
+            )
 
         self.camera = camera
         self.robot = robot

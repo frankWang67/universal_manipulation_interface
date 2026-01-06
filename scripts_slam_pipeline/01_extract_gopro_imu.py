@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 # %%
 @click.command()
-@click.option('-d', '--docker_image', default="chicheng/openicc:latest")
+@click.option('-d', '--docker_image', default="crpi-o1dhoy4ov0sd5o1w.cn-beijing.personal.cr.aliyuncs.com/wshf-docker-mirror/wshf-docker-mirror-1:openicc_latest")
 @click.option('-n', '--num_workers', type=int, default=None)
 @click.option('-np', '--no_docker_pull', is_flag=True, default=False, help="pull docker image from docker hub")
 @click.argument('session_dir', nargs=-1)

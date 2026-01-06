@@ -25,7 +25,7 @@ from umi.common.cv_util import draw_predefined_mask
 @click.command()
 @click.option('-i', '--input_dir', required=True, help='Directory for mapping video')
 @click.option('-m', '--map_path', default=None, help='ORB_SLAM3 *.osa map atlas file')
-@click.option('-d', '--docker_image', default="chicheng/orb_slam3:latest")
+@click.option('-d', '--docker_image', default="crpi-o1dhoy4ov0sd5o1w.cn-beijing.personal.cr.aliyuncs.com/wshf-docker-mirror/wshf-docker-mirror-1:orb_slam3_latest")
 @click.option('-np', '--no_docker_pull', is_flag=True, default=False, help="pull docker image from docker hub")
 @click.option('-nm', '--no_mask', is_flag=True, default=False, help="Whether to mask out gripper and mirrors. Set if map is created with bare GoPro no on gripper.")
 def main(input_dir, map_path, docker_image, no_docker_pull, no_mask):
@@ -61,7 +61,7 @@ def main(input_dir, map_path, docker_image, no_docker_pull, no_mask):
         mask_write_path = video_dir.joinpath('slam_mask.png')
         slam_mask = np.zeros((2028, 2704), dtype=np.uint8)
         slam_mask = draw_predefined_mask(
-            slam_mask, color=255, mirror=True, gripper=False, finger=True)
+            slam_mask, color=255, mirror=False, gripper=False, finger=True)
         cv2.imwrite(str(mask_write_path.absolute()), slam_mask)
 
     map_mount_source = pathlib.Path(map_path)

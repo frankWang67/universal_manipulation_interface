@@ -42,9 +42,11 @@ import scipy.spatial.transform as st
 import skvideo.io
 import torch
 import zarr
+import json
 from omegaconf import OmegaConf
 
 from umi.common.interpolation_util import get_interp1d, PoseInterpolator
+from umi.common.pose_util import pose_to_mat, mat_to_pose
 from diffusion_policy.common.pose_trajectory_interpolator import pose_distance
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.cv2_util import get_image_transform
@@ -55,7 +57,8 @@ from umi.common.precise_sleep import precise_wait
 from umi.real_world.umi_env import UmiEnv
 from umi.real_world.real_inference_util import (get_real_obs_dict,
                                                 get_real_obs_resolution)
-from umi.real_world.spacemouse_shared_memory import Spacemouse
+# from umi.real_world.spacemouse_shared_memory import Spacemouse
+from umi.real_world.keyboard_spacemouse_shared_memory import KeyboardSpacemouse as Spacemouse
 from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, JpegXl
 register_codecs()
 
@@ -65,19 +68,38 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--input', '-i', required=True, help='Path to dataset')
 @click.option('--output', '-o', required=True, help='Directory to save recording')
 @click.option('--replay_episode', '-re', type=int, default=0)
-# @click.option('--robot_ip', '-ri', default='172.24.95.9')
-# @click.option('--gripper_ip', '-gi', default='172.24.95.17')
-@click.option('--robot_ip', default='172.24.95.8')
+@click.option('--robot_ip', default='192.168.54.130')
 @click.option('--gripper_ip', default='172.24.95.18')
 @click.option('--camera_reorder', '-cr', default='120')
 @click.option('--vis_camera_idx', default=0, type=int, help="Which RealSense camera to visualize.")
 @click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robot joint configuration in the beginning.")
 @click.option('--frequency', '-f', default=60, type=float, help="Control frequency in Hz.")
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
+@click.option('--calibration_file', '-cf', required=True, type=str, help="Path to the hand-eye calibration file.")
 def main(input, output, replay_episode, robot_ip, gripper_ip,
     camera_reorder,
     vis_camera_idx, init_joints, 
-    frequency, command_latency):
+    frequency, command_latency, calibration_file):
+
+    # 加载标定矩阵
+    with open(calibration_file, 'r') as f:
+        calib_data = json.load(f)
+    T_base_tag = np.array(calib_data['tx_base2world'])
+    T_tag_base = np.linalg.inv(T_base_tag)
+    T_gripper_cam = np.array(calib_data['tx_gripper2camera'])
+    T_cam_gripper = np.linalg.inv(T_gripper_cam)
+    
+    # 定义一个转换函数，方便后续使用
+    def tag_pose_to_base(pose_tag):
+        # T_tag_eef = pose_to_mat(pose_tag)
+        # T_base_eef = T_tag_base @ T_tag_eef
+        # return mat_to_pose(T_base_eef)
+
+        T_tag_cam = pose_to_mat(pose_tag)
+        T_base_cam = T_tag_base @ T_tag_cam
+        T_base_gripper = T_base_cam @ T_cam_gripper
+        return mat_to_pose(T_base_gripper)
+
     max_gripper_width = 0.09
     gripper_speed = 0.2
 
@@ -109,10 +131,12 @@ def main(input, output, replay_episode, robot_ip, gripper_ip,
             gripper_action_latency=0.0,
             # obs
             # action
-            max_pos_speed=2.0,
-            max_rot_speed=6.0,
-            shm_manager=shm_manager) as env:
+            max_pos_speed=0.1,
+            max_rot_speed=0.3,
+            shm_manager=shm_manager
+        ) as env:
             cv2.setNumThreads(2)
+            cv2.namedWindow('default', cv2.WINDOW_NORMAL)
             print("Waiting for camera")
             time.sleep(1.0)
 
@@ -142,6 +166,7 @@ def main(input, output, replay_episode, robot_ip, gripper_ip,
                     start_pos = replay_buffer['robot0_eef_pos'][start_idx]
                     start_rot = replay_buffer['robot0_eef_rot_axis_angle'][start_idx]
                     start_pose = np.concatenate([start_pos, start_rot])
+                    start_pose_in_base = tag_pose_to_base(start_pose)
                     start_gripper_width = replay_buffer['robot0_gripper_width'][start_idx]
                     match_img = match_img.astype(np.float32) / 255
                     avg_img = (vis_img + match_img) / 2
@@ -168,8 +193,9 @@ def main(input, output, replay_episode, robot_ip, gripper_ip,
                         pos = obs['robot0_eef_pos'][-1]
                         rot = obs['robot0_eef_rot_axis_angle'][-1]
                         pose = np.concatenate([pos, rot])
-                        pos_dist, rot_dist = pose_distance(start_pose, pose)
-                        if pos_dist < 0.01 and rot_dist < 0.05:
+                        # pos_dist, rot_dist = pose_distance(start_pose, pose)
+                        pos_dist, rot_dist = pose_distance(start_pose_in_base, pose)
+                        if pos_dist < 0.2 and rot_dist < 0.05:
                             # hand control over to the policy
                             break
                         else:
@@ -183,12 +209,14 @@ def main(input, output, replay_episode, robot_ip, gripper_ip,
                     elif key_stroke == ord('m'):
                         # move the robot
                         duration = 3.0
-                        env.robot.servoL(start_pose, duration=duration)
+                        # env.robot.servoL(start_pose, duration=duration)
+                        env.robot.servoL(start_pose_in_base, duration=duration)
                         gripper_target_pos = start_gripper_width
                         start_t = time.time()
                         episode_data = replay_buffer.get_episode(replay_episode)
                         time.sleep(max(duration - (time.time() - start_t), 0))
-                        target_pose = start_pose
+                        # target_pose = start_pose
+                        target_pose = start_pose_in_base
                         
                     precise_wait(t_sample)
                     # get teleop command
@@ -253,10 +281,15 @@ def main(input, output, replay_episode, robot_ip, gripper_ip,
                         data_idx = exec_data_idxs[iter_idx]
 
                         obs = env.get_obs()
-                        pose = data_pose_interpolator(t)
-                        pose[2] -= 0.02
-                        grip = data_gripper_interpolator(t) - 0.005
-                        action = np.concatenate([pose, grip], axis=-1)
+                        # pose = data_pose_interpolator(t)
+                        # pose[2] -= 0.02
+                        raw_pose_tag = data_pose_interpolator(t)
+                        # raw_pose_tag[2] -= 0.02
+                        # grip = data_gripper_interpolator(t) - 0.005
+                        grip = data_gripper_interpolator(t)
+                        # action = np.concatenate([pose, grip], axis=-1)
+                        action_pose_base = tag_pose_to_base(raw_pose_tag)
+                        action = np.concatenate([action_pose_base, grip], axis=-1)
 
                         env.exec_actions(
                             actions=[action], 

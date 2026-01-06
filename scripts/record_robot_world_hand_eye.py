@@ -15,7 +15,8 @@ import pickle
 import pathlib
 from multiprocessing.managers import SharedMemoryManager
 import scipy.spatial.transform as st
-from umi.real_world.spacemouse_shared_memory import Spacemouse
+# from umi.real_world.spacemouse_shared_memory import Spacemouse
+from umi.real_world.keyboard_spacemouse_shared_memory import KeyboardSpacemouse as Spacemouse
 from umi.real_world.uvc_camera import UvcCamera
 from umi.real_world.rtde_interpolation_controller import RTDEInterpolationController
 from umi.real_world.keystroke_counter import KeystrokeCounter, KeyCode, Key
@@ -25,13 +26,13 @@ from umi.common.precise_sleep import precise_wait
 # %%
 @click.command()
 @click.option('-o', '--output', required=True, type=str)
-@click.option('-r', '--robot_ip', default='172.24.95.8')
+@click.option('-r', '--robot_ip', default='192.168.54.130', type=str)
 @click.option('-v', '--v4l_idx', type=int, default=0)
 def main(output, robot_ip, v4l_idx):
     cv2.setNumThreads(4)
 
-    max_pos_speed = 0.25
-    max_rot_speed = 0.6
+    max_pos_speed = 0.1
+    max_rot_speed = 0.3
     frequency = 10
     cube_diag = np.linalg.norm([1,1,1])
     dt = 1 / frequency
@@ -74,8 +75,10 @@ def main(output, robot_ip, v4l_idx):
             state = controller.get_state()
             target_pose = state['TargetTCPPose']
             stop = False
+
             while not stop:
                 t_cycle_start = time.time()
+                t_cycle_end = t_cycle_start + dt
                 # handle image stuff
                 data = camera.get()
                 img = data['color']
@@ -112,7 +115,7 @@ def main(output, robot_ip, v4l_idx):
                         # delete latest
                         if len(record_data_buffer) > 0:
                             record_data_buffer.pop()
-                    elif key_stroke == KeyCode(char='s'):
+                    elif key_stroke == KeyCode(char='v'):
                         # save
                         out_path = pathlib.Path(output)
                         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +134,8 @@ def main(output, robot_ip, v4l_idx):
 
                 controller.schedule_waypoint(target_pose, time.time() + dt)
                 # print(f"Running at {1 / (time.time() - t_cycle_start)}")
+
+                precise_wait(t_cycle_end, time_func=time.time)
 
 # %%
 if __name__ == '__main__':

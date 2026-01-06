@@ -13,21 +13,23 @@ import time
 import numpy as np
 from multiprocessing.managers import SharedMemoryManager
 import scipy.spatial.transform as st
-from umi.real_world.spacemouse_shared_memory import Spacemouse
+# from umi.real_world.spacemouse_shared_memory import Spacemouse
+from umi.real_world.keyboard_spacemouse_shared_memory import KeyboardSpacemouse as Spacemouse
 from umi.real_world.rtde_interpolation_controller import RTDEInterpolationController
 from umi.real_world.wsg_controller import WSGController
+from umi.real_world.robotiq_controller import RobotiqController
 from umi.common.precise_sleep import precise_wait
 
 # %%
 @click.command()
-@click.option('-rh', '--robot_hostname', default='192.168.0.8')
+@click.option('-rh', '--robot_hostname', default='192.168.54.130')
 @click.option('-gh', '--gripper_hostname', default='192.168.0.18')
 @click.option('-gp', '--gripper_port', type=int, default=1000)
 @click.option('-f', '--frequency', type=float, default=30)
-@click.option('-gs', '--gripper_speed', type=float, default=200.0)
+@click.option('-gs', '--gripper_speed', type=float, default=0.05)
 def main(robot_hostname, gripper_hostname, gripper_port, frequency, gripper_speed):
-    max_pos_speed = 0.25
-    max_rot_speed = 0.6
+    max_pos_speed = 0.1
+    max_rot_speed = 0.3
     cube_diag = np.linalg.norm([1,1,1])
     tcp_offset = 0.13
     # tcp_offset = 0
@@ -35,15 +37,16 @@ def main(robot_hostname, gripper_hostname, gripper_port, frequency, gripper_spee
     command_latency = dt / 2
 
     with SharedMemoryManager() as shm_manager:
-        with WSGController(
-            shm_manager=shm_manager,
-            hostname=gripper_hostname,
-            port=gripper_port,
-            frequency=frequency,
-            move_max_speed=400.0,
-            verbose=False
-        ) as gripper,\
-        RTDEInterpolationController(
+        # with WSGController(
+        #     shm_manager=shm_manager,
+        #     hostname=gripper_hostname,
+        #     port=gripper_port,
+        #     frequency=frequency,
+        #     move_max_speed=400.0,
+        #     verbose=False
+        # ) as gripper,\
+        # RTDEInterpolationController(
+        with RTDEInterpolationController(
             shm_manager=shm_manager,
             robot_ip=robot_hostname,
             frequency=500,
@@ -52,8 +55,12 @@ def main(robot_hostname, gripper_hostname, gripper_port, frequency, gripper_spee
             max_pos_speed=max_pos_speed*cube_diag,
             max_rot_speed=max_rot_speed*cube_diag,
             tcp_offset_pose=[0,0,tcp_offset,0,0,0],
-            verbose=False
+            verbose=False,
         ) as controller,\
+        RobotiqController(
+            shm_manager=shm_manager,
+            verbose=False,
+        ) as gripper,\
         Spacemouse(
             shm_manager=shm_manager
         ) as sm:
@@ -61,7 +68,7 @@ def main(robot_hostname, gripper_hostname, gripper_port, frequency, gripper_spee
             # to account for recever interfance latency, use target pose
             # to init buffer.
             state = controller.get_state()
-            target_pose = state['TargetTCPPose']
+            target_pose = state['ActualTCPPose']
             gripper_target_pos = gripper.get_state()['gripper_position']
             t_start = time.monotonic()
             gripper.restart_put(t_start-time.monotonic() + time.time())
@@ -90,7 +97,7 @@ def main(robot_hostname, gripper_hostname, gripper_port, frequency, gripper_spee
                     dpos = -gripper_speed / frequency
                 if sm.is_button_pressed(1):
                     dpos = gripper_speed / frequency
-                gripper_target_pos = np.clip(gripper_target_pos + dpos, 0, 90.)
+                gripper_target_pos = np.clip(gripper_target_pos + dpos, 0.0, gripper.gripper.width)
  
                 controller.schedule_waypoint(target_pose, 
                     t_command_target-time.monotonic()+time.time())
@@ -99,7 +106,7 @@ def main(robot_hostname, gripper_hostname, gripper_port, frequency, gripper_spee
 
                 precise_wait(t_cycle_end)
                 iter_idx += 1
-                print(1/(time.time() -s))
+                # print(1/(time.time() -s))
 
 
 # %%
