@@ -192,7 +192,7 @@ def detect_localize_aruco_tags(
     return tag_dict
 
 def get_charuco_board(
-        aruco_dict=cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100), 
+        aruco_dict=cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250), 
         tag_id_offset=50,
         grid_size=(8, 5), square_length_mm=50, tag_length_mm=30):
     

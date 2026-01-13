@@ -18,6 +18,7 @@ class Command(enum.Enum):
 class RobotiqController(mp.Process):
     def __init__(self,
             shm_manager: SharedMemoryManager,
+            port: str = "/dev/ttyUSB0",
             frequency=30,
             move_max_speed=255,
             move_max_force=255,
@@ -27,7 +28,7 @@ class RobotiqController(mp.Process):
             verbose=False
             ):
         super().__init__(name="RobotiqController", daemon=True)
-        self.gripper = RobotiqModBusGripper()
+        self.gripper = RobotiqModBusGripper(port=port)
         self.frequency = frequency
         self.move_max_speed = move_max_speed
         self.move_max_force = move_max_force

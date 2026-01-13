@@ -136,7 +136,8 @@ class UmiEnv:
                     return data
                 transform.append(tf4k)
             else:
-                res = (1920, 1080)
+                # res = (1920, 1080)
+                res = (1280, 720)
                 fps = 60
                 buf = 1
                 bit_rate = 3000*1000
@@ -283,6 +284,7 @@ class UmiEnv:
         self.max_pos_speed = max_pos_speed
         self.max_rot_speed = max_rot_speed
         self.mirror_crop = mirror_crop
+        self.tcp_offset = tcp_offset
         # timing
         self.align_camera_idx = align_camera_idx
         self.camera_obs_latency = camera_obs_latency

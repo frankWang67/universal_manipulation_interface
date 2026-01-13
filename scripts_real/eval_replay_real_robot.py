@@ -86,19 +86,12 @@ def main(input, output, replay_episode, robot_ip, gripper_ip,
         calib_data = json.load(f)
     T_base_tag = np.array(calib_data['tx_base2world'])
     T_tag_base = np.linalg.inv(T_base_tag)
-    T_gripper_cam = np.array(calib_data['tx_gripper2camera'])
-    T_cam_gripper = np.linalg.inv(T_gripper_cam)
     
     # 定义一个转换函数，方便后续使用
     def tag_pose_to_base(pose_tag):
-        # T_tag_eef = pose_to_mat(pose_tag)
-        # T_base_eef = T_tag_base @ T_tag_eef
-        # return mat_to_pose(T_base_eef)
-
-        T_tag_cam = pose_to_mat(pose_tag)
-        T_base_cam = T_tag_base @ T_tag_cam
-        T_base_gripper = T_base_cam @ T_cam_gripper
-        return mat_to_pose(T_base_gripper)
+        T_tag_eef = pose_to_mat(pose_tag)
+        T_base_eef = T_tag_base @ T_tag_eef
+        return mat_to_pose(T_base_eef)
 
     max_gripper_width = 0.09
     gripper_speed = 0.2
@@ -195,7 +188,7 @@ def main(input, output, replay_episode, robot_ip, gripper_ip,
                         pose = np.concatenate([pos, rot])
                         # pos_dist, rot_dist = pose_distance(start_pose, pose)
                         pos_dist, rot_dist = pose_distance(start_pose_in_base, pose)
-                        if pos_dist < 0.2 and rot_dist < 0.05:
+                        if pos_dist < 0.2 and rot_dist < 0.5:
                             # hand control over to the policy
                             break
                         else:
@@ -260,6 +253,29 @@ def main(input, output, replay_episode, robot_ip, gripper_ip,
                     data_pose = np.concatenate([episode_data['robot0_eef_pos'], episode_data['robot0_eef_rot_axis_angle']], axis=-1)
                     data_pose_interpolator = PoseInterpolator(data_timestamps, data_pose)
                     data_gripper_interpolator = get_interp1d(data_timestamps + 0.05, episode_data['robot0_gripper_width'])
+
+                    # === [新增] 计算相对轨迹的 Offset 矩阵 ===
+                    # 1. 获取当前机器人实际所在的起始位姿 (Base Frame)
+                    obs_start = env.get_obs()
+                    actual_start_pose = np.concatenate([
+                        obs_start['robot0_eef_pos'][-1], 
+                        obs_start['robot0_eef_rot_axis_angle'][-1]
+                    ])
+                    T_actual_start = pose_to_mat(actual_start_pose)
+
+                    # 2. 获取回放轨迹中记录的第0帧位姿 (转换为 Base Frame)
+                    # 注意：必须使用和下面循环中完全一致的 tag_pose_to_base 转换逻辑
+                    raw_rec_start_tag = data_pose_interpolator(0)
+                    rec_start_pose_base = tag_pose_to_base(raw_rec_start_tag)
+                    T_rec_start = pose_to_mat(rec_start_pose_base)
+
+                    # 3. 计算变换矩阵 T_offset
+                    # T_actual = T_offset * T_rec
+                    # T_offset = T_actual * inv(T_rec)
+                    T_offset = T_actual_start @ np.linalg.inv(T_rec_start)
+                    print(f"Relative replay enabled. Offset applied.")
+                    # ==========================================
+                    
                     # camera
                     exec_timestamps = np.arange(int(np.floor(data_timestamps[-1] * frequency))) / frequency
                     exec_data_idxs = np.round(np.clip(exec_timestamps, 0, data_timestamps[-1]) * data_frequency).astype(np.int32)
@@ -288,8 +304,24 @@ def main(input, output, replay_episode, robot_ip, gripper_ip,
                         # grip = data_gripper_interpolator(t) - 0.005
                         grip = data_gripper_interpolator(t)
                         # action = np.concatenate([pose, grip], axis=-1)
-                        action_pose_base = tag_pose_to_base(raw_pose_tag)
-                        action = np.concatenate([action_pose_base, grip], axis=-1)
+
+                        # ===== [原始] 直接使用记录的绝对位姿作为 action =====
+                        # action_pose_base = tag_pose_to_base(raw_pose_tag)
+                        # action = np.concatenate([action_pose_base, grip], axis=-1)
+                        # ===============================================
+
+                        # === [新增] 根据相对位姿计算 action ===
+                        # 1. 先将记录的 Tag 坐标转换到 Base 坐标 (原始绝对轨迹)
+                        rec_pose_base = tag_pose_to_base(raw_pose_tag)
+                        
+                        # 2. 应用 Offset 矩阵
+                        T_rec_pose = pose_to_mat(rec_pose_base)
+                        T_target = T_offset @ T_rec_pose
+                        target_pose_base = mat_to_pose(T_target)
+
+                        # 3. 组合动作
+                        action = np.concatenate([target_pose_base, grip], axis=-1)
+                        # ==================================
 
                         env.exec_actions(
                             actions=[action], 
