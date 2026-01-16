@@ -28,7 +28,7 @@ class RobotiqController(mp.Process):
             verbose=False
             ):
         super().__init__(name="RobotiqController", daemon=True)
-        self.gripper = RobotiqModBusGripper(port=port)
+        self.gripper = RobotiqModBusGripper(width=0.085, port=port)
         self.frequency = frequency
         self.move_max_speed = move_max_speed
         self.move_max_force = move_max_force

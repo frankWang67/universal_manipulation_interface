@@ -69,7 +69,7 @@ class UmiEnv:
             max_pos_speed=0.25,
             max_rot_speed=0.6,
             # robot
-            tcp_offset=0.21,
+            tcp_offset=0.21-0.04,
             init_joints=False,
             # vis params
             enable_multi_cam_vis=True,

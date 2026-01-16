@@ -11,6 +11,7 @@ from umi.common.pose_util import (
     mat_to_pose10d, pose10d_to_mat)
 from diffusion_policy.model.common.rotation_transformer import \
     RotationTransformer
+import time
 
 def get_real_obs_resolution(
         shape_meta: dict
@@ -204,3 +205,18 @@ def get_real_umi_action(
 
     env_action = np.concatenate(env_action, axis=-1)
     return env_action
+
+# Added by WSHF, used for sync wait
+def wait_until_still(env, velocity_threshold=0.01, timeout=5.0):
+    t_start = time.time()
+    while time.time() - t_start < timeout:
+        state = env.get_robot_state()
+        tcp_vel = np.linalg.norm(state['ActualTCPSpeed'])
+
+        if tcp_vel < velocity_threshold:
+            return True
+        
+        time.sleep(0.01)
+
+    print(f"[WARNING] Wait for still timed out! Vel: {tcp_vel:.3f}")
+    return False

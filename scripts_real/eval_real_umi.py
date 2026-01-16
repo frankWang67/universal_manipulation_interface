@@ -64,7 +64,8 @@ from umi.real_world.keystroke_counter import (
 from umi.real_world.real_inference_util import (get_real_obs_dict,
                                                 get_real_obs_resolution,
                                                 get_real_umi_obs_dict,
-                                                get_real_umi_action)
+                                                get_real_umi_action,
+                                                wait_until_still)
 # from umi.real_world.spacemouse_shared_memory import Spacemouse
 from umi.real_world.keyboard_spacemouse_shared_memory import KeyboardSpacemouse as Spacemouse
 
@@ -85,13 +86,14 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--max_duration', '-md', default=60, help='Max duration for each epoch in seconds.')
 @click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
-@click.option('-nm', '--no_mirror', is_flag=True, default=True)
+@click.option('-nm', '--no_mirror', is_flag=True, default=False)
 @click.option('-sf', '--sim_fov', type=float, default=None)
 @click.option('-ci', '--camera_intrinsics', type=str, default=None)
 @click.option('-rt', '--robot_type', default='ur5')
 @click.option('--mirror_crop', is_flag=True, default=False)
 @click.option('--mirror_swap', is_flag=True, default=False)
 @click.option('--calibration_file', '-cf', required=True, type=str, help="Path to the hand-eye calibration file.")
+@click.option('--blocking', '-b', is_flag=True, default=False, help="Whether to use blocking execution mode.")
 def main(input, output, robot_ip, gripper_ip, 
     match_dataset, match_episode, match_camera,
     camera_reorder,
@@ -99,7 +101,7 @@ def main(input, output, robot_ip, gripper_ip,
     steps_per_inference, max_duration,
     frequency, command_latency, 
     no_mirror, sim_fov, camera_intrinsics, robot_type, 
-    mirror_crop, mirror_swap, calibration_file):
+    mirror_crop, mirror_swap, calibration_file, blocking):
 
     # 加载标定矩阵
     with open(calibration_file, 'r') as f:
@@ -157,6 +159,21 @@ def main(input, output, robot_ip, gripper_ip,
         )
 
     print("steps_per_inference:", steps_per_inference)
+    if not blocking:
+        print("Using async execution mode.")
+        camera_obs_latency = 0.1327
+        robot_obs_latency = 0.0001
+        gripper_obs_latency = 0.015
+        robot_action_latency = 0.3
+        gripper_action_latency = 0.03
+    else:
+        print("Using blocking execution mode.")
+        camera_obs_latency = 0.0
+        robot_obs_latency = 0.0
+        gripper_obs_latency = 0.0
+        robot_action_latency = 0.0
+        gripper_action_latency = 0.0
+
     with SharedMemoryManager() as shm_manager:
         with Spacemouse(shm_manager=shm_manager) as sm, \
             KeystrokeCounter() as key_counter, \
@@ -171,16 +188,11 @@ def main(input, output, robot_ip, gripper_ip,
                 init_joints=init_joints,
                 enable_multi_cam_vis=True,
                 # latency
-                camera_obs_latency=0.17,
-                robot_obs_latency=0.0001,
-                gripper_obs_latency=0.01,
-                robot_action_latency=0.18,
-                gripper_action_latency=0.1,
-                # camera_obs_latency=0.0,
-                # robot_obs_latency=0.0,
-                # gripper_obs_latency=0.0,
-                # robot_action_latency=0.0,
-                # gripper_action_latency=0.0,
+                camera_obs_latency=camera_obs_latency,
+                robot_obs_latency=robot_obs_latency,
+                gripper_obs_latency=gripper_obs_latency,
+                robot_action_latency=robot_action_latency,
+                gripper_action_latency=gripper_action_latency,
                 # obs
                 camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
                 robot_obs_horizon=cfg.task.shape_meta.obs.robot0_eef_pos.horizon,
@@ -382,7 +394,7 @@ def main(input, output, robot_ip, gripper_ip,
                     target_pose[:3] += dpos
                     target_pose[3:] = (drot * st.Rotation.from_rotvec(
                         target_pose[3:])).as_rotvec()
-                    target_pose[2] = np.maximum(target_pose[2], 0.055)
+                    # target_pose[2] = np.maximum(target_pose[2], 0.055)
                     
                     dpos = 0
                     if sm.is_button_pressed(0):
@@ -431,7 +443,7 @@ def main(input, output, robot_ip, gripper_ip,
                             obs['robot0_eef_rot_axis_angle'][-1]
                         ])]
                         obs_timestamps = obs['timestamp']
-                        print(f'Obs latency {time.time() - obs_timestamps[-1]}')
+                        # print(f'Obs latency {time.time() - obs_timestamps[-1]}')
 
                         # run inference
                         with torch.no_grad():
@@ -446,7 +458,16 @@ def main(input, output, robot_ip, gripper_ip,
                             result = policy.predict_action(obs_dict)
                             raw_action = result['action_pred'][0].detach().to('cpu').numpy()
                             action = get_real_umi_action(raw_action, obs, action_pose_repr)
-                            print('Inference latency:', time.time() - s)
+                            # print('Inference latency:', time.time() - s)
+
+                        # === [新增修复代码] 强制夹爪动作相对化 ===
+                        current_gripper_width = obs['robot0_gripper_width'][-1]
+                        pred_gripper_traj = action[:, -1]
+                        shift = current_gripper_width - pred_gripper_traj[0]
+                        new_gripper_traj = pred_gripper_traj + shift
+                        new_gripper_traj = np.clip(new_gripper_traj, 0, env.gripper.gripper.width)
+                        action[:, -1] = new_gripper_traj
+                        # ==========================================
                         
                         # convert policy action to env actions
                         this_target_poses = action
@@ -479,7 +500,12 @@ def main(input, output, robot_ip, gripper_ip,
                             timestamps=action_timestamps,
                             compensate_latency=True
                         )
-                        print(f"Submitted {len(this_target_poses)} steps of actions.")
+                        # print(f"Submitted {len(this_target_poses)} steps of actions.")
+
+                        if blocking:
+                            action_duration = action.shape[1] * dt
+                            time.sleep(action_duration * 0.8)
+                            wait_until_still(env, velocity_threshold=0.0001, timeout=5.0)
 
                         # visualize
                         episode_id = env.replay_buffer.n_episodes
@@ -521,9 +547,10 @@ def main(input, output, robot_ip, gripper_ip,
                             env.end_episode()
                             break
 
-                        # wait for execution
-                        precise_wait(t_cycle_end - frame_latency)
-                        iter_idx += steps_per_inference
+                        if not blocking:
+                            # wait for execution
+                            precise_wait(t_cycle_end - frame_latency)
+                            iter_idx += steps_per_inference
 
                 except KeyboardInterrupt:
                     print("Interrupted!")

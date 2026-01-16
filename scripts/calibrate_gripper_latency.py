@@ -14,7 +14,8 @@ import numpy as np
 from collections import deque
 from tqdm import tqdm
 from multiprocessing.managers import SharedMemoryManager
-from umi.real_world.wsg_controller import WSGController
+# from umi.real_world.wsg_controller import WSGController
+from umi.real_world.robotiq_controller import RobotiqController
 from umi.common.precise_sleep import precise_sleep
 from umi.common.latency_util import get_latency
 from matplotlib import pyplot as plt
@@ -30,15 +31,24 @@ def main(hostname, port, frequency):
     k = int(duration / sample_dt)
     sample_t = np.linspace(0, duration, k)
     value = np.sin(sample_t * duration / 1.5) * 0.5 + 0.5
-    width = value * 80
+    width = value * 0.085
 
     with SharedMemoryManager() as shm_manager:
-        with WSGController(
+        # with WSGController(
+        #     shm_manager=shm_manager,
+        #     hostname=hostname,
+        #     port=port,
+        #     frequency=frequency,
+        #     move_max_speed=200.0,
+        #     get_max_k=int(k*1.2),
+        #     command_queue_size=int(k*1.2),
+        #     verbose=False) as gripper:
+        with RobotiqController(
             shm_manager=shm_manager,
-            hostname=hostname,
-            port=port,
+            port="/dev/ttyUSB0",
             frequency=frequency,
-            move_max_speed=200.0,
+            move_max_speed=255,
+            move_max_force=255,
             get_max_k=int(k*1.2),
             command_queue_size=int(k*1.2),
             verbose=False) as gripper:
