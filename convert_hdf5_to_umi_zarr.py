@@ -16,6 +16,7 @@ import h5py
 import zarr
 import argparse
 import numpy as np
+from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, Jpeg2k
@@ -57,7 +58,7 @@ def convert_dataset(input_h5_path, output_path, camera_name='hand_camera', image
     print("Loading episodes...")
 
     with h5py.File(input_h5_path, 'r') as f:
-        for i in range(len(f)):
+        for i in tqdm(range(len(f)), desc="Converting episodes"):
             traj_key = f"/traj_{i}"
             tcp_key = f"{traj_key}/obs/extra/tcp_pose"
             qpos_key = f"{traj_key}/obs/agent/qpos"

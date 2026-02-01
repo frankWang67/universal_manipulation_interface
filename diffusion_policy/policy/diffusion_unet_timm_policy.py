@@ -119,7 +119,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor], fixed_action_prefix: torch.Tensor=None) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], fixed_action_prefix: torch.Tensor=None, env_batched=False) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         fixed_action_prefix: unnormalized action prefix
@@ -131,10 +131,17 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         B = next(iter(nobs.values())).shape[0]
 
         # condition through global feature
+        if env_batched:
+            env_batch_size = next(iter(nobs.values())).shape[1]
+            nobs = dict_apply(nobs, 
+                lambda x: x.reshape(B * env_batch_size, *x.shape[2:]))
         global_cond = self.obs_encoder(nobs)
 
         # empty data for action
-        cond_data = torch.zeros(size=(B, self.action_horizon, self.action_dim), device=self.device, dtype=self.dtype)
+        if env_batched:
+            cond_data = torch.zeros(size=(B*env_batch_size, self.action_horizon, self.action_dim), device=self.device, dtype=self.dtype)
+        else:
+            cond_data = torch.zeros(size=(B, self.action_horizon, self.action_dim), device=self.device, dtype=self.dtype)
         cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
 
         if fixed_action_prefix is not None and self.inpaint_fixed_action_prefix:
@@ -153,8 +160,13 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
             **self.kwargs)
         
         # unnormalize prediction
-        assert nsample.shape == (B, self.action_horizon, self.action_dim)
+        if env_batched:
+            assert nsample.shape == (B * env_batch_size, self.action_horizon, self.action_dim)
+        else:
+            assert nsample.shape == (B, self.action_horizon, self.action_dim)
         action_pred = self.normalizer['action'].unnormalize(nsample)
+        if env_batched:
+            action_pred = action_pred.reshape(B, env_batch_size, self.action_horizon, self.action_dim)
         
         result = {
             'action': action_pred,

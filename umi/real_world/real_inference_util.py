@@ -4,7 +4,8 @@ import collections
 from diffusion_policy.common.cv2_util import get_image_transform
 from diffusion_policy.common.pose_repr_util import (
     compute_relative_pose, 
-    convert_pose_mat_rep
+    convert_pose_mat_rep, 
+    batched_convert_pose_mat_rep, 
 )
 from umi.common.pose_util import (
     pose_to_mat, mat_to_pose, 
@@ -12,6 +13,28 @@ from umi.common.pose_util import (
 from diffusion_policy.model.common.rotation_transformer import \
     RotationTransformer
 import time
+
+def env_obs_to_pose_mat(
+    env_obs: Dict[str, np.ndarray],
+    robot_prefix: str='robot0',
+) -> np.ndarray:
+    if env_obs[f'{robot_prefix}_eef_pos'].ndim == 2:
+        batched = False
+        pos = env_obs[f'{robot_prefix}_eef_pos']
+        rot = env_obs[f'{robot_prefix}_eef_rot_axis_angle']
+    elif env_obs[f'{robot_prefix}_eef_pos'].ndim == 3:
+        batched = True
+        batch_size = env_obs[f'{robot_prefix}_eef_pos'].shape[0]
+        time_horizon = env_obs[f'{robot_prefix}_eef_pos'].shape[1]
+        pos = env_obs[f'{robot_prefix}_eef_pos'].reshape(-1,3)
+        rot = env_obs[f'{robot_prefix}_eef_rot_axis_angle'].reshape(-1,3)
+    else:
+        raise ValueError("Invalid pose shape")
+    pose = np.concatenate([pos, rot], axis=-1)
+    pose_mat = pose_to_mat(pose)
+    if batched:
+        pose_mat = pose_mat.reshape(batch_size, time_horizon, 4, 4)
+    return pose_mat
 
 def get_real_obs_resolution(
         shape_meta: dict
@@ -66,6 +89,7 @@ def get_real_umi_obs_dict(
         obs_pose_repr: str='abs',
         tx_robot1_robot0: np.ndarray=None,
         episode_start_pose: List[np.ndarray]=None,
+        batched: bool=False
         ) -> Dict[str, np.ndarray]:
     obs_dict_np = dict()
     # process non-pose
@@ -76,20 +100,20 @@ def get_real_umi_obs_dict(
         shape = attr.get('shape')
         if type == 'rgb':
             this_imgs_in = env_obs[key]
-            t,hi,wi,ci = this_imgs_in.shape
+            hi,wi,ci = this_imgs_in.shape[-3:]
             co,ho,wo = shape
             assert ci == co
             out_imgs = this_imgs_in
-            if (ho != hi) or (wo != wi) or (this_imgs_in.dtype == np.uint8):
+            if (ho != hi) or (wo != wi):
                 tf = get_image_transform(
                     input_res=(wi,hi), 
                     output_res=(wo,ho), 
                     bgr_to_rgb=False)
                 out_imgs = np.stack([tf(x) for x in this_imgs_in])
-                if this_imgs_in.dtype == np.uint8:
-                    out_imgs = out_imgs.astype(np.float32) / 255
+            if this_imgs_in.dtype == np.uint8:
+                out_imgs = out_imgs.astype(np.float32) / 255
             # THWC to TCHW
-            obs_dict_np[key] = np.moveaxis(out_imgs,-1,1)
+            obs_dict_np[key] = np.moveaxis(out_imgs,-1,-3)
         elif type == 'low_dim' and ('eef' not in key):
             this_data_in = env_obs[key]
             obs_dict_np[key] = this_data_in
@@ -98,18 +122,17 @@ def get_real_umi_obs_dict(
             if ks[0].startswith('robot'):
                 robot_prefix_map[ks[0]].append(key)
 
+    convert_pose_mat_rep_func = batched_convert_pose_mat_rep if batched else convert_pose_mat_rep
+
     # generate relative pose
     for robot_prefix in robot_prefix_map.keys():
         # convert pose to mat
-        pose_mat = pose_to_mat(np.concatenate([
-            env_obs[robot_prefix + '_eef_pos'],
-            env_obs[robot_prefix + '_eef_rot_axis_angle']
-        ], axis=-1))
+        pose_mat = env_obs_to_pose_mat(env_obs, robot_prefix)
 
         # solve reltaive obs
-        obs_pose_mat = convert_pose_mat_rep(
+        obs_pose_mat = convert_pose_mat_rep_func(
             pose_mat, 
-            base_pose_mat=pose_mat[-1],
+            base_pose_mat=pose_mat[:, -1] if batched else pose_mat[-1],
             pose_rep=obs_pose_repr,
             backward=False)
 
@@ -122,10 +145,7 @@ def get_real_umi_obs_dict(
     for robot_id in range(n_robots):
         # convert pose to mat
         assert f'robot{robot_id}' in robot_prefix_map
-        tx_robota_tcpa = pose_to_mat(np.concatenate([
-            env_obs[f'robot{robot_id}_eef_pos'],
-            env_obs[f'robot{robot_id}_eef_rot_axis_angle']
-        ], axis=-1))
+        tx_robota_tcpa = env_obs_to_pose_mat(env_obs, f'robot{robot_id}')
         for other_robot_id in range(n_robots):
             if robot_id == other_robot_id:
                 continue
@@ -138,36 +158,33 @@ def get_real_umi_obs_dict(
                 tx_robota_robotb = np.linalg.inv(tx_robot1_robot0)
             tx_robota_tcpb = tx_robota_robotb @ tx_robotb_tcpb
 
-            rel_obs_pose_mat = convert_pose_mat_rep(
+            rel_obs_pose_mat = convert_pose_mat_rep_func(
                 tx_robota_tcpa,
-                base_pose_mat=tx_robota_tcpb[-1],
+                base_pose_mat=tx_robota_tcpb[:, -1] if batched else tx_robota_tcpb[-1],
                 pose_rep='relative',
                 backward=False)
             rel_obs_pose = mat_to_pose10d(rel_obs_pose_mat)
-            obs_dict_np[f'robot{robot_id}_eef_pos_wrt{other_robot_id}'] = rel_obs_pose[:,:3]
-            obs_dict_np[f'robot{robot_id}_eef_rot_axis_angle_wrt{other_robot_id}'] = rel_obs_pose[:,3:]
+            obs_dict_np[f'robot{robot_id}_eef_pos_wrt{other_robot_id}'] = rel_obs_pose[...,:3]
+            obs_dict_np[f'robot{robot_id}_eef_rot_axis_angle_wrt{other_robot_id}'] = rel_obs_pose[...,3:]
 
     # generate relative pose with respect to episode start
     if episode_start_pose is not None:
         for robot_id in range(n_robots):        
             # convert pose to mat
-            pose_mat = pose_to_mat(np.concatenate([
-                env_obs[f'robot{robot_id}_eef_pos'],
-                env_obs[f'robot{robot_id}_eef_rot_axis_angle']
-            ], axis=-1))
+            pose_mat = env_obs_to_pose_mat(env_obs, f'robot{robot_id}')
             
             # get start pose
             start_pose = episode_start_pose[robot_id]
             start_pose_mat = pose_to_mat(start_pose)
-            rel_obs_pose_mat = convert_pose_mat_rep(
+            rel_obs_pose_mat = convert_pose_mat_rep_func(
                 pose_mat,
                 base_pose_mat=start_pose_mat,
                 pose_rep='relative',
                 backward=False)
             
             rel_obs_pose = mat_to_pose10d(rel_obs_pose_mat)
-            # obs_dict_np[f'robot{robot_id}_eef_pos_wrt_start'] = rel_obs_pose[:,:3]
-            obs_dict_np[f'robot{robot_id}_eef_rot_axis_angle_wrt_start'] = rel_obs_pose[:,3:]
+            # obs_dict_np[f'robot{robot_id}_eef_pos_wrt_start'] = rel_obs_pose[...,:3]
+            obs_dict_np[f'robot{robot_id}_eef_rot_axis_angle_wrt_start'] = rel_obs_pose[...,3:]
 
     return obs_dict_np
 

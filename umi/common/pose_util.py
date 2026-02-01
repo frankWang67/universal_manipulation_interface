@@ -32,6 +32,12 @@ def pose_to_mat(pose):
 def mat_to_pose(mat):
     return pos_rot_to_pose(*mat_to_pos_rot(mat))
 
+def mat_to_euler_pose(mat, seq='xyz', degrees=False):
+    pos, rot = mat_to_pos_rot(mat)
+    euler = rot.as_euler(seq, degrees=degrees)
+    pose = np.concatenate([pos, euler], axis=-1)
+    return pose
+
 def transform_pose(tx, pose):
     """
     tx: tx_new_old

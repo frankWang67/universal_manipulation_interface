@@ -110,3 +110,15 @@ def convert_pose_mat_rep(pose_mat, base_pose_mat, pose_rep='abs', backward=False
         else:
             raise RuntimeError(f"Unsupported pose_rep: {pose_rep}")
             
+def batched_convert_pose_mat_rep(pose_mat, base_pose_mat, pose_rep='abs', backward=False):
+    B = pose_mat.shape[0]
+    
+    # 1. 遍历 Batch 维度，逐个调用原函数
+    # 原函数 convert_pose_mat_rep 可以在这里直接调用
+    results = [
+        convert_pose_mat_rep(pose_mat[i], base_pose_mat[i], pose_rep, backward) 
+        for i in range(B)
+    ]
+    
+    # 2. 将结果堆叠回 (B, T, 4, 4)
+    return np.stack(results, axis=0)

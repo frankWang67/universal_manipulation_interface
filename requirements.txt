@@ -20,16 +20,6 @@ einops==0.6.1
 diffusers==0.18.2
 scikit-video==1.1.11
 # trick to avoid cpu affinity issue described in https://github.com/pytorch/pytorch/issues/99625
-llvm-openmp==14
-python-lmdb==1.4
-timm==0.9.7
-scikit-fda==0.9
-cython==0.29
-accelerate==0.24
-boto3==1.33
-exiftool==12
-aiohttp==3.9
-aiofiles==23.2
 
 ray[default]==2.8.0
 threadpoolctl==3.2
@@ -47,3 +37,6 @@ free-mujoco-py==2.1.6
 robosuite @ https://github.com/cheng-chi/robosuite/archive/3f2c3116f1c0a1916e94bfa28da4d055927d1ab3.tar.gz
 # implicitly depend on conda package exiftool
 PyExifTool==0.5
+moviepy==1.0.3
+zerorpc
+huggingface_hub==0.25.2
