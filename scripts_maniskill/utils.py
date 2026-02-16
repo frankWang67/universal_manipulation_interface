@@ -8,8 +8,10 @@ from scipy.spatial.transform import Rotation as R
 
 from umi.common.pose_util import (
     pose_to_mat, 
+    pose10d_to_mat,
+    mat_to_pose,
     mat_to_euler_pose, 
-    pose10d_to_mat
+    mat_to_quat_pose,
 )
 from umi.real_world.real_inference_util import get_real_umi_obs_dict
 from diffusion_policy.common.pytorch_util import dict_apply
@@ -219,7 +221,10 @@ def get_maniskill_umi_action(
         # convert action to pose
         if batched:
             action_mat = action_mat.reshape(batch_size * time_horizon, 4, 4)
-        action_pose = mat_to_euler_pose(action_mat)
+        # ===== CHANGE FROM EULER TO QUATERNION =====
+        # action_pose = mat_to_euler_pose(action_mat)
+        action_pose = mat_to_quat_pose(action_mat)
+        # ===========================================
         if batched:
             action_pose = action_pose.reshape(batch_size, time_horizon, -1)
         env_action.append(action_pose)
@@ -259,10 +264,8 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, device, progre
             raw_action = result['action_pred'].detach().to('cpu').numpy()
             action_seq = get_maniskill_umi_action(raw_action, obs, action_pose_repr, batched=True)
 
-            # print("=" * 20 + " Debug Info " + "=" * 20)
             for i in range(steps_per_inference):
                 obs, rew, terminated, truncated, info = eval_envs.step(action_seq[:, i])
-                # print(f"{i=}, {action_seq[:, i]=}")
                 if truncated.any():
                     break
 

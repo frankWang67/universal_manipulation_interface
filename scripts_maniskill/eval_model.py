@@ -8,6 +8,7 @@ os.chdir(ROOT_DIR)
 
 import warnings
 warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
+warnings.filterwarnings("ignore", message=".*CUDA reports that you have.*")
 
 # %%
 import click
@@ -119,7 +120,7 @@ def main(input, ckpt_filename, env_id, robot_uids, sim_backend, control_mode, nu
         action = result['action_pred'].detach().to('cpu').numpy()
         assert action.shape[-1] == 10
         action = get_maniskill_umi_action(action, obs, action_pose_repr, batched=True)
-        assert action.shape[-1] == 7
+        assert action.shape[-1] == 8
         del result
 
     print('Ready! Start evaluation.')

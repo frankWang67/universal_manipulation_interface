@@ -70,7 +70,7 @@ def convert_dataset(input_h5_path, output_path, camera_name='hand_camera', image
             images = f[img_key][()]  # (T, H, W, C)
             
             # Load actions
-            action = f[action_key][()]  # (T, 7): similar structure to qpos
+            action = f[action_key][()]  # (T, 8): similar structure to qpos
             
             # Extract components from qpos (observations)
             ee_pos = tcp_pose[:, :3]  # (T, 3)
@@ -78,12 +78,16 @@ def convert_dataset(input_h5_path, output_path, camera_name='hand_camera', image
             
             # Extract components from action
             action_ee_pos = action[:, :3]  # (T, 3)
-            action_ee_euler = action[:, 3:6]  # (T, 3) - euler angles
-            action_gripper = action[:, 6:7]  # (T, 1)
+            # ===== CHANGE FROM EULER TO QUATERNION =====
+            # action_ee_euler = action[:, 3:6]  # (T, 3) - euler angles
+            action_ee_quat = action[:, 3:7]  # (T, 4) - quaternion in w,x,y,z format
+            # ===========================================
+            action_gripper = action[:, 7:8]  # (T, 1)
             
             # Convert quaternions to axis-angle
             ee_rot_axis_angle = quaternion_to_axis_angle(ee_quat)  # (T, 3)
-            action_ee_rot_axis_angle = euler_to_axis_angle(action_ee_euler)  # (T, 3)
+            # action_ee_rot_axis_angle = euler_to_axis_angle(action_ee_euler)  # (T, 3)
+            action_ee_rot_axis_angle = quaternion_to_axis_angle(action_ee_quat)  # (T, 3)
 
             episode_data = {
                 'ee_pos': ee_pos.astype(np.float32),

@@ -38,6 +38,13 @@ def mat_to_euler_pose(mat, seq='xyz', degrees=False):
     pose = np.concatenate([pos, euler], axis=-1)
     return pose
 
+def mat_to_quat_pose(mat):
+    pos, rot = mat_to_pos_rot(mat)
+    quat = rot.as_quat() # (x,y,z,w)
+    quat = np.concatenate([quat[...,3:], quat[...,:3]], axis=-1) # convert to (w,x,y,z)
+    pose = np.concatenate([pos, quat], axis=-1)
+    return pose
+
 def transform_pose(tx, pose):
     """
     tx: tx_new_old
