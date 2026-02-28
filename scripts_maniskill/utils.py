@@ -233,7 +233,7 @@ def get_maniskill_umi_action(
     env_action = np.concatenate(env_action, axis=-1)
     return env_action
 
-def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, device, progress_bar: bool = True):
+def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, device, progress_bar: bool = True):
     assert steps_per_inference >= 1 and steps_per_inference <= cfg.task.action_horizon, \
         f"steps_per_inference should be in [1, {cfg.task.action_horizon}], but got {steps_per_inference}"
     obs_pose_rep = cfg.task.pose_repr.obs_pose_repr
@@ -260,7 +260,13 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, device, progre
             )
             obs_dict = dict_apply(obs_dict_np, 
                 lambda x: torch.from_numpy(x).to(device))
-            result = policy.predict_action(obs_dict, env_batched=False)
+            if add_guidance:
+                episode_start_pose_tensor = torch.from_numpy(episode_start_pose[0]).to(device)
+                obstacle_info = eval_envs.call("get_obstacles_info")
+            else:
+                episode_start_pose_tensor = None
+                obstacle_info = []
+            result = policy.predict_action(obs_dict, env_batched=False, episode_start_pose=episode_start_pose_tensor, obstacle_info=obstacle_info)
             raw_action = result['action_pred'].detach().to('cpu').numpy()
             action_seq = get_maniskill_umi_action(raw_action, obs, action_pose_repr, batched=True)
 

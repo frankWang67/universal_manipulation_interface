@@ -83,6 +83,8 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
             local_cond=None,
             global_cond=None,
             generator=None,
+            episode_start_pose=None,
+            obstacle_info=[],
             # keyword arguments to scheduler.step
             **kwargs
         ):
@@ -119,7 +121,13 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor], fixed_action_prefix: torch.Tensor=None, env_batched=False) -> Dict[str, torch.Tensor]:
+    def predict_action(self, 
+        obs_dict: Dict[str, torch.Tensor], 
+        fixed_action_prefix: torch.Tensor=None, 
+        env_batched=False,
+        episode_start_pose: torch.Tensor=None,
+        obstacle_info=[],
+    ) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         fixed_action_prefix: unnormalized action prefix
@@ -157,7 +165,10 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
             condition_mask=cond_mask,
             local_cond=None,
             global_cond=global_cond,
-            **self.kwargs)
+            episode_start_pose=episode_start_pose,
+            obstacle_info=obstacle_info,
+            **self.kwargs
+        )
         
         # unnormalize prediction
         if env_batched:
