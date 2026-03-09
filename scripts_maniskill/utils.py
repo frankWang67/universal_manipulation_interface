@@ -1,3 +1,4 @@
+import time
 import torch
 import numpy as np
 import gymnasium as gym
@@ -245,6 +246,12 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, 
         eval_metrics = defaultdict(list)
         obs, info = eval_envs.reset()
         eps_count = 0
+        # ======= BEGIN ADDED: INFERENCE TIMING STATS =======
+        # These variables track how many times we call the model and
+        # the accumulated wall-clock time spent in `policy.predict_action`.
+        inference_call_count = 0
+        inference_time_total = 0.0
+        # ======== END ADDED: INFERENCE TIMING STATS ========
         while eps_count < n:
             # obs = common.to_tensor(obs, device)
             obs = maniskill_to_umi_env_obs(obs)
@@ -266,7 +273,16 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, 
             else:
                 episode_start_pose_tensor = None
                 obstacle_info = []
+            # ======= BEGIN ADDED: MEASURE MODEL INFERENCE =======
+            # Time the model inference call so we can compute calls/sec
+            t0 = time.perf_counter()
+            # ======== END ADDED: MEASURE MODEL INFERENCE ========
             result = policy.predict_action(obs_dict, env_batched=False, episode_start_pose=episode_start_pose_tensor, obstacle_info=obstacle_info)
+            # ======= BEGIN ADDED: MEASURE MODEL INFERENCE =======
+            dt = time.perf_counter() - t0
+            inference_call_count += 1
+            inference_time_total += dt
+            # ======== END ADDED: MEASURE MODEL INFERENCE ========
             raw_action = result['action_pred'].detach().to('cpu').numpy()
             action_seq = get_maniskill_umi_action(raw_action, obs, action_pose_repr, batched=True)
 
@@ -290,4 +306,16 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, 
 
     for k in eval_metrics.keys():
         eval_metrics[k] = np.stack(eval_metrics[k])
+
+    # ======= BEGIN ADDED: INFERENCE STATISTICS (OUTPUT) =======
+    # Expose inference timing metrics and print a concise summary.
+    if inference_time_total > 0:
+        frequency = inference_call_count / inference_time_total
+    else:
+        frequency = 0.0
+    eval_metrics['inference_calls'] = np.array([inference_call_count])
+    eval_metrics['inference_total_time'] = np.array([inference_time_total])
+    eval_metrics['inference_frequency'] = np.array([frequency])
+    print(f"Inference calls: {inference_call_count}, total time: {inference_time_total:.4f}s, frequency: {frequency:.2f} calls/s")
+    # ======== END ADDED: INFERENCE STATISTICS (OUTPUT) ========
     return eval_metrics
