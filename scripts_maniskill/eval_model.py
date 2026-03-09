@@ -48,6 +48,7 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--max_episode_steps', '-mes', default=500, type=int, help="Max episode steps for evaluation.")
 @click.option('--harder', is_flag=True, help="Whether to use harder environment setting with more obstacles and narrower workspace.")
 @click.option('--add_guidance', is_flag=True, help="Whether to add obstacle avoidance guidance during inference.")
+@click.option('--joint_space', is_flag=True, help="Whether the policy is a joint space diffusion policy.")
 def main(
     input, 
     ckpt_filename, 
@@ -63,6 +64,7 @@ def main(
     max_episode_steps,
     harder,
     add_guidance,
+    joint_space,
 ):
     # load checkpoint
     exp_path = input
@@ -74,6 +76,8 @@ def main(
     cfg = payload['cfg']
     if add_guidance:
         cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_with_guidance.DiffusionUnetTimmPolicyWithGuidance"
+    if joint_space:
+        cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_joint_space.DiffusionUnetTimmPolicyJointSpace"
     print("model_name:", cfg.policy.obs_encoder.model_name)
     print("dataset_path:", cfg.task.dataset.dataset_path)
 
@@ -142,7 +146,7 @@ def main(
         )
         obs_dict = dict_apply(obs_dict_np, 
             lambda x: torch.from_numpy(x).to(device))
-        if add_guidance:
+        if add_guidance or joint_space:
             episode_start_pose_tensor = torch.from_numpy(episode_start_pose[0]).to(device)
         else:
             episode_start_pose_tensor = None
@@ -155,7 +159,7 @@ def main(
 
     print('Ready! Start evaluation.')
     eval_metrics = evaluate(
-        num_eval_episodes, cfg, policy, env, steps_per_inference, add_guidance, device, 
+        num_eval_episodes, cfg, policy, env, steps_per_inference, add_guidance, joint_space, device, 
     )
     print("Evaluation results over {} episodes:".format(num_eval_episodes))
     success_once_rate = np.mean(eval_metrics["success_once"])

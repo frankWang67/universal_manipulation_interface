@@ -234,7 +234,7 @@ def get_maniskill_umi_action(
     env_action = np.concatenate(env_action, axis=-1)
     return env_action
 
-def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, device, progress_bar: bool = True):
+def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, joint_space, device, progress_bar: bool = True):
     assert steps_per_inference >= 1 and steps_per_inference <= cfg.task.action_horizon, \
         f"steps_per_inference should be in [1, {cfg.task.action_horizon}], but got {steps_per_inference}"
     obs_pose_rep = cfg.task.pose_repr.obs_pose_repr
@@ -245,6 +245,7 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, 
     with torch.no_grad():
         eval_metrics = defaultdict(list)
         obs, info = eval_envs.reset()
+        current_joint_angles = torch.tensor(obs["joint_state"][:, -1, :])
         eps_count = 0
         # ======= BEGIN ADDED: INFERENCE TIMING STATS =======
         # These variables track how many times we call the model and
@@ -267,9 +268,12 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, 
             )
             obs_dict = dict_apply(obs_dict_np, 
                 lambda x: torch.from_numpy(x).to(device))
-            if add_guidance:
+            if add_guidance or joint_space:
                 episode_start_pose_tensor = torch.from_numpy(episode_start_pose[0]).to(device)
-                obstacle_info = eval_envs.call("get_obstacles_info")
+                if add_guidance:
+                    obstacle_info = eval_envs.call("get_obstacles_info")
+                else:
+                    obstacle_info = []
             else:
                 episode_start_pose_tensor = None
                 obstacle_info = []
@@ -277,7 +281,13 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, 
             # Time the model inference call so we can compute calls/sec
             t0 = time.perf_counter()
             # ======== END ADDED: MEASURE MODEL INFERENCE ========
-            result = policy.predict_action(obs_dict, env_batched=False, episode_start_pose=episode_start_pose_tensor, obstacle_info=obstacle_info)
+            result = policy.predict_action(
+                obs_dict, 
+                env_batched=False, 
+                episode_start_pose=episode_start_pose_tensor, 
+                obstacle_info=obstacle_info, 
+                current_joint_angles=current_joint_angles,
+            )
             # ======= BEGIN ADDED: MEASURE MODEL INFERENCE =======
             dt = time.perf_counter() - t0
             inference_call_count += 1
@@ -290,6 +300,7 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, 
                 obs, rew, terminated, truncated, info = eval_envs.step(action_seq[:, i])
                 if truncated.any():
                     break
+            current_joint_angles = torch.tensor(obs["joint_state"][:, -1, :])
 
             if truncated.any():
                 assert truncated.all() == truncated.any(), "all episodes should truncate at the same time for fair evaluation with other algorithms"
