@@ -92,10 +92,13 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         ee_link_name: str = "eef",
         arm_dof: int = 7,
         ik_num_seeds: int = 20,
-        jacobian_damping: float = 1e-4,
-        ik_refine_each_step: bool = True,
+        jacobian_damping: float = 0.01,
+        ik_refine_each_step: bool = False,
         ik_position_threshold: float = 5e-4,
         ik_rotation_threshold: float = 5e-3,
+        init_noise_scale: float = 0.3,
+        max_dq_per_step: float = 0.5,
+        ik_refine_last_step: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -109,6 +112,9 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         self.ik_refine_each_step = bool(ik_refine_each_step)
         self.ik_position_threshold = float(ik_position_threshold)
         self.ik_rotation_threshold = float(ik_rotation_threshold)
+        self.init_noise_scale = float(init_noise_scale)
+        self.max_dq_per_step = float(max_dq_per_step)
+        self.ik_refine_last_step = bool(ik_refine_last_step)
 
         self._ik_solver = None
         self._kin_model = None
@@ -387,13 +393,15 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
     def _dls_pinv_map(self, twist: torch.Tensor, jacobian: torch.Tensor) -> torch.Tensor:
         """
         twist: (N,6), jacobian: (N,6,D) -> dq: (N,D)
+        Damped least-squares pseudo-inverse: dq = J^T (J J^T + λ I)^{-1} twist
+        Uses torch.linalg.solve instead of explicit inverse for stability.
         """
-        n, _, d = jacobian.shape
         j_t = jacobian.transpose(-2, -1)
         jjt = jacobian @ j_t
-        eye = torch.eye(6, device=jacobian.device, dtype=jacobian.dtype).unsqueeze(0).expand(n, 6, 6)
-        j_pinv = j_t @ torch.linalg.inv(jjt + self.jacobian_damping * eye)
-        dq = (j_pinv @ twist.unsqueeze(-1)).squeeze(-1)
+        eye = torch.eye(6, device=jacobian.device, dtype=jacobian.dtype).unsqueeze(0)
+        A = jjt + self.jacobian_damping * eye
+        y = torch.linalg.solve(A, twist.unsqueeze(-1))  # (N,6,1)
+        dq = (j_t @ y).squeeze(-1)  # (N,D)
         return dq
 
     # ===========================
@@ -480,8 +488,20 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
 
         model = self.model
         scheduler = self.noise_scheduler
+        bsz = condition_data.shape[0]
+        horizon = condition_data.shape[1]
 
-        # 1) Cartesian normalized noise initialization (same as standard policy)
+        # ── 1) Obtain starting joint configuration ──────────────────────
+        if current_joint_angles is None:
+            q_start = self._solve_start_joint_from_pose(episode_start_pose)
+        else:
+            q_start = current_joint_angles[..., : self._robot_dof].to(
+                device=condition_data.device, dtype=condition_data.dtype
+            )
+        q_seed = q_start.unsqueeze(1).expand(bsz, horizon, self._robot_dof)
+
+        # ── 2) Initialize noisy joint trajectory ────────────────────────
+        # Generate normalized Cartesian noise (same as vanilla DDPM).
         trajectory_cart_n = torch.randn(
             size=condition_data.shape,
             dtype=condition_data.dtype,
@@ -490,115 +510,163 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         )
         trajectory_cart_n[condition_mask] = condition_data[condition_mask]
 
-        # 2) Unnormalize + relative->absolute + IK => initial joint-space noisy action
         trajectory_cart = self.normalizer["action"].unnormalize(trajectory_cart_n)
-        rel_pose9 = trajectory_cart[..., :9]
         grip = trajectory_cart[..., 9:10]
 
-        abs_pos, abs_rot = self._relative_pose9_to_absolute(rel_pose9, episode_start_pose)
-        bsz, horizon, _ = abs_pos.shape
-
-        if current_joint_angles is None:
-            q_start = self._solve_start_joint_from_pose(episode_start_pose)
-        else:
-            q_start = current_joint_angles[..., : self._robot_dof].to(device=condition_data.device, dtype=condition_data.dtype)
-        q_seed = q_start.unsqueeze(1).expand(bsz, horizon, self._robot_dof)
-
-        q_arm = self._ik_from_absolute(abs_pos, abs_rot, q_seed)
+        # Direct joint noise: small σ keeps joints in the well-
+        # conditioned neighborhood of q_seed where the Jacobian
+        # linearization is accurate.
+        q_arm = q_seed + torch.randn(
+            q_seed.shape, device=q_seed.device, dtype=q_seed.dtype,
+        ) * self.init_noise_scale
         q_traj = torch.cat([q_arm, grip], dim=-1)
 
-        # precompute conditioned joint targets when inpainting is used
+        # ── 3) Precompute conditioned joint targets (for inpainting) ────
         cond_step_mask = condition_mask.any(dim=-1)
         q_cond = None
         if torch.any(cond_step_mask):
             cond_cart = self.normalizer["action"].unnormalize(condition_data)
-            cond_abs_pos, cond_abs_rot = self._relative_pose9_to_absolute(cond_cart[..., :9], episode_start_pose)
+            cond_abs_pos, cond_abs_rot = self._relative_pose9_to_absolute(
+                cond_cart[..., :9], episode_start_pose
+            )
             q_cond_arm = self._ik_from_absolute(cond_abs_pos, cond_abs_rot, q_seed)
             q_cond = torch.cat([q_cond_arm, cond_cart[..., 9:10]], dim=-1)
             q_traj[cond_step_mask] = q_cond[cond_step_mask]
 
-        # 3) Denoising in joint space
-        # NOTE: scheduler update is computed in normalized Cartesian space
-        # to stay numerically equivalent to the vanilla model. The resulting
-        # Cartesian delta is then mapped to joint delta via Jacobian.
+        # ── 4) Denoising in joint space ─────────────────────────────────
         scheduler.set_timesteps(self.num_inference_steps)
 
-        debug = {
-            "step_cart_l2": [],
-        }
+        debug = {"step_cart_l2": []}
+        timesteps = list(scheduler.timesteps)
+        n_steps = len(timesteps)
 
-        for t in scheduler.timesteps:
-                if q_cond is not None:
-                    q_traj[cond_step_mask] = q_cond[cond_step_mask]
+        for idx, t in enumerate(timesteps):
+            if q_cond is not None:
+                q_traj[cond_step_mask] = q_cond[cond_step_mask]
 
-                # q_t -> Cartesian normalized sample for model input
-                abs_pose9_curr = self._joint_action_to_absolute_pose9(q_traj)
-                cart_phys_curr = self._joint_action_to_relative_cartesian(q_traj, episode_start_pose)
-                cart_n_curr = self.normalizer["action"].normalize(cart_phys_curr)
-                cart_n_curr[condition_mask] = condition_data[condition_mask]
+            # ── FK once → build both absolute and relative Cartesian ────
+            q_arm_curr = q_traj[..., : self._robot_dof]
+            grip_curr = q_traj[..., self._robot_dof : self._robot_dof + 1]
+            abs_pos_curr, abs_rot_curr = self._fk_to_absolute(q_arm_curr)
 
-                # model predicts epsilon in normalized Cartesian space
-                eps_cart_n = model(cart_n_curr, t, local_cond=local_cond, global_cond=global_cond)
+            rel_pose9_curr = self._absolute_pose_to_relative9(
+                abs_pos_curr, abs_rot_curr, episode_start_pose
+            )
+            cart_phys_curr = torch.cat([rel_pose9_curr, grip_curr], dim=-1)
+            cart_n_curr = self.normalizer["action"].normalize(cart_phys_curr)
+            cart_n_curr[condition_mask] = condition_data[condition_mask]
 
-                # vanilla-equivalent DDPM update in normalized Cartesian space
-                cart_n_prev_tgt = scheduler.step(
-                    eps_cart_n,
-                    t,
-                    cart_n_curr,
-                    generator=generator,
-                    **kwargs,
-                ).prev_sample
-                cart_n_prev_tgt[condition_mask] = condition_data[condition_mask]
-                cart_phys_prev_tgt = self.normalizer["action"].unnormalize(cart_n_prev_tgt)
+            # ── Model predicts epsilon in normalized Cartesian space ────
+            eps_cart_n = model(
+                cart_n_curr, t, local_cond=local_cond, global_cond=global_cond
+            )
 
-                # Convert target relative pose to absolute/world pose, then
-                # compute world-frame twist to match Jacobian convention.
-                abs_pos_tgt, abs_rot_tgt = self._relative_pose9_to_absolute(
-                    cart_phys_prev_tgt[..., :9],
-                    episode_start_pose,
+            # ── Scheduler step in normalized Cartesian space ────────────
+            cart_n_prev_tgt = scheduler.step(
+                eps_cart_n, t, cart_n_curr, generator=generator, **kwargs,
+            ).prev_sample
+            cart_n_prev_tgt[condition_mask] = condition_data[condition_mask]
+            cart_phys_prev_tgt = self.normalizer["action"].unnormalize(
+                cart_n_prev_tgt
+            )
+
+            # ── Target absolute pose ────────────────────────────────────
+            abs_pos_tgt, abs_rot_tgt = self._relative_pose9_to_absolute(
+                cart_phys_prev_tgt[..., :9], episode_start_pose,
+            )
+
+            # ── World-frame twist (current → target) ────────────────────
+            abs_rot6d_curr = matrix_to_rot6d(
+                abs_rot_curr.reshape(-1, 3, 3)
+            ).reshape(bsz, horizon, 6)
+            abs_pose9_curr_9d = torch.cat(
+                [abs_pos_curr, abs_rot6d_curr], dim=-1
+            )
+
+            abs_rot6d_tgt = matrix_to_rot6d(
+                abs_rot_tgt.reshape(-1, 3, 3)
+            ).reshape(bsz, horizon, 6)
+            abs_pose9_tgt = torch.cat(
+                [abs_pos_tgt, abs_rot6d_tgt], dim=-1
+            )
+
+            twist6 = self._absolute_pose_delta_to_twist6(
+                abs_pose9_curr_9d, abs_pose9_tgt
+            )
+
+            # ── Clamped Jacobian step + reuse sub-iterations ─────────────
+            jac = self._jacobian(q_arm_curr)
+            dq = self._dls_pinv_map(
+                twist6.reshape(-1, 6), jac,
+            ).reshape(bsz, horizon, self._robot_dof)
+            if self.max_dq_per_step > 0:
+                dq = torch.clamp(
+                    dq, -self.max_dq_per_step, self.max_dq_per_step
                 )
-                abs_rot6d_tgt = matrix_to_rot6d(abs_rot_tgt.reshape(-1, 3, 3)).reshape(bsz, horizon, 6)
-                abs_pose9_tgt = torch.cat([abs_pos_tgt, abs_rot6d_tgt], dim=-1)
+            q_arm_new = q_arm_curr + dq
 
-                twist6 = self._absolute_pose_delta_to_twist6(abs_pose9_curr, abs_pose9_tgt)
-                jac = self._jacobian(q_traj[..., : self._robot_dof])
-
-                dq_flat = self._dls_pinv_map(
-                    twist6.reshape(-1, 6),
-                    jac,
+            # Reuse sub-iterations: same Jacobian, refresh FK + twist
+            for _ in range(2):
+                abs_pos_ri, abs_rot_ri = self._fk_to_absolute(q_arm_new)
+                abs_rot6d_ri = matrix_to_rot6d(
+                    abs_rot_ri.reshape(-1, 3, 3)
+                ).reshape(bsz, horizon, 6)
+                abs_pose9_ri = torch.cat(
+                    [abs_pos_ri, abs_rot6d_ri], dim=-1
                 )
-                dq_arm = dq_flat.reshape(bsz, horizon, self._robot_dof)
-
-                # Joint update; gripper follows Cartesian target directly.
-                q_traj[..., : self._robot_dof] = q_traj[..., : self._robot_dof] + dq_arm
-                q_traj[..., self._robot_dof : self._robot_dof + 1] = cart_phys_prev_tgt[..., 9:10]
-
-                # Optional IK projection (seeded by Jacobian update) to reduce
-                # linearization error and keep Cartesian/joint trajectories aligned.
-                if self.ik_refine_each_step:
-                    q_refined = self._ik_from_absolute(
-                        abs_pos_tgt,
-                        abs_rot_tgt,
-                        q_traj[..., : self._robot_dof],
+                twist_ri = self._absolute_pose_delta_to_twist6(
+                    abs_pose9_ri, abs_pose9_tgt
+                )
+                dq_ri = self._dls_pinv_map(
+                    twist_ri.reshape(-1, 6), jac,
+                ).reshape(bsz, horizon, self._robot_dof)
+                if self.max_dq_per_step > 0:
+                    dq_ri = torch.clamp(
+                        dq_ri, -self.max_dq_per_step, self.max_dq_per_step
                     )
-                    q_traj[..., : self._robot_dof] = q_refined
+                q_arm_new = q_arm_new + dq_ri
 
-                if return_debug:
-                    cart_phys_after = self._joint_action_to_relative_cartesian(q_traj, episode_start_pose)
-                    debug["step_cart_l2"].append(
-                        torch.linalg.norm(
-                            (cart_phys_after - cart_phys_prev_tgt).reshape(bsz, -1),
-                            dim=-1,
-                        ).detach().cpu()
-                    )
+            # ── Optional cuRobo IK refine ───────────────────────────────
+            is_last = (idx == n_steps - 1)
+            if self.ik_refine_each_step or (is_last and self.ik_refine_last_step):
+                q_arm_new = self._ik_from_absolute(
+                    abs_pos_tgt, abs_rot_tgt, q_arm_new
+                )
+
+            # ── Joint update; gripper follows Cartesian target ──────────
+            q_traj = torch.cat([
+                q_arm_new,
+                cart_phys_prev_tgt[..., 9:10],
+            ], dim=-1)
+
+            if return_debug:
+                q_arm_dbg = q_traj[..., : self._robot_dof]
+                abs_p, abs_r = self._fk_to_absolute(q_arm_dbg)
+                rel9 = self._absolute_pose_to_relative9(
+                    abs_p, abs_r, episode_start_pose
+                )
+                cart_phys_after = torch.cat(
+                    [rel9, q_traj[..., self._robot_dof : self._robot_dof + 1]],
+                    dim=-1,
+                )
+                debug["step_cart_l2"].append(
+                    torch.linalg.norm(
+                        (cart_phys_after - cart_phys_prev_tgt).reshape(bsz, -1),
+                        dim=-1,
+                    ).detach().cpu()
+                )
 
         if q_cond is not None:
             q_traj[cond_step_mask] = q_cond[cond_step_mask]
 
         self._last_joint_traj = q_traj.detach()
 
-        # return normalized Cartesian action (keeps external API unchanged)
-        cart_final = self._joint_action_to_relative_cartesian(q_traj, episode_start_pose)
+        # ── Return normalized Cartesian action (keeps external API unchanged)
+        q_arm_final = q_traj[..., : self._robot_dof]
+        grip_final = q_traj[..., self._robot_dof : self._robot_dof + 1]
+        abs_p_f, abs_r_f = self._fk_to_absolute(q_arm_final)
+        rel9_f = self._absolute_pose_to_relative9(abs_p_f, abs_r_f, episode_start_pose)
+        cart_final = torch.cat([rel9_f, grip_final], dim=-1)
         cart_final_n = self.normalizer["action"].normalize(cart_final)
         cart_final_n[condition_mask] = condition_data[condition_mask]
         if return_debug:

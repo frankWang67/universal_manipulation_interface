@@ -127,6 +127,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         env_batched=False,
         episode_start_pose: torch.Tensor=None,
         obstacle_info=[],
+        current_joint_angles=None,
     ) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key

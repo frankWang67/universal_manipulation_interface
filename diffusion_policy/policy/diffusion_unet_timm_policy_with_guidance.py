@@ -39,6 +39,7 @@ class DiffusionUnetTimmPolicyWithGuidance(DiffusionUnetTimmPolicy):
         generator=None,
         episode_start_pose=None,
         obstacle_info=[],
+        current_joint_angles=None,
         # keyword arguments to scheduler.step
         **kwargs
     ):
