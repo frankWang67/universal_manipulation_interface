@@ -1,7 +1,6 @@
 from typing import Dict, Optional, Tuple
 
 import torch
-import numpy as np
 import pytorch_kinematics as pk
 
 from curobo.types.base import TensorDeviceType
@@ -13,52 +12,14 @@ from curobo.util_file import get_robot_configs_path, join_path, load_yaml
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.policy.diffusion_unet_timm_policy import DiffusionUnetTimmPolicy
 
-
-def axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
-    """axis_angle: (...,3) -> (...,3,3)."""
-    theta = torch.linalg.norm(axis_angle, dim=-1, keepdim=True)
-    axis = axis_angle / torch.clamp(theta, min=1e-8)
-    x, y, z = axis.unbind(dim=-1)
-    c = torch.cos(theta[..., 0])
-    s = torch.sin(theta[..., 0])
-    one_c = 1.0 - c
-
-    r00 = c + x * x * one_c
-    r01 = x * y * one_c - z * s
-    r02 = x * z * one_c + y * s
-    r10 = y * x * one_c + z * s
-    r11 = c + y * y * one_c
-    r12 = y * z * one_c - x * s
-    r20 = z * x * one_c - y * s
-    r21 = z * y * one_c + x * s
-    r22 = c + z * z * one_c
-
-    return torch.stack(
-        [
-            torch.stack([r00, r01, r02], dim=-1),
-            torch.stack([r10, r11, r12], dim=-1),
-            torch.stack([r20, r21, r22], dim=-1),
-        ],
-        dim=-2,
-    )
-
-
-def rot6d_to_matrix(rot6d: torch.Tensor) -> torch.Tensor:
-    x_raw = rot6d[..., :3]
-    y_raw = rot6d[..., 3:]
-
-    x_axis = torch.nn.functional.normalize(x_raw, dim=-1)
-    y_proj = (y_raw * x_axis).sum(dim=-1, keepdim=True) * x_axis
-    y_axis = torch.nn.functional.normalize(y_raw - y_proj, dim=-1)
-    z_axis = torch.cross(x_axis, y_axis, dim=-1)
-    return torch.stack([x_axis, y_axis, z_axis], dim=-2)
-
-
-def matrix_to_rot6d(rot_mat: torch.Tensor) -> torch.Tensor:
-    x_axis = rot_mat[..., 0, :]
-    y_axis = rot_mat[..., 1, :]
-    return torch.cat([x_axis, y_axis], dim=-1)
-
+from mani_skill.utils.geometry.rotation_conversions import (
+    axis_angle_to_matrix,
+    matrix_to_axis_angle,
+    matrix_to_quaternion,
+    matrix_to_rotation_6d as matrix_to_rot6d,
+    quaternion_to_matrix,
+    rotation_6d_to_matrix as rot6d_to_matrix,
+)
 
 def pose9d_to_mat(pose9d: torch.Tensor) -> torch.Tensor:
     pos = pose9d[..., :3]
@@ -153,110 +114,6 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         self._pk_chain = pk.build_serial_chain_from_urdf(urdf_str, self.ee_link_name)
         self._pk_chain = self._pk_chain.to(dtype=torch.float32, device=device)
 
-    # ===========================
-    # Math helpers
-    # ===========================
-    @staticmethod
-    def _quat_wxyz_to_matrix(quat: torch.Tensor) -> torch.Tensor:
-        """quat: (...,4) in wxyz."""
-        q = quat / torch.clamp(torch.linalg.norm(quat, dim=-1, keepdim=True), min=1e-8)
-        w, x, y, z = q.unbind(dim=-1)
-
-        ww = w * w
-        xx = x * x
-        yy = y * y
-        zz = z * z
-        wx = w * x
-        wy = w * y
-        wz = w * z
-        xy = x * y
-        xz = x * z
-        yz = y * z
-
-        m00 = ww + xx - yy - zz
-        m01 = 2 * (xy - wz)
-        m02 = 2 * (xz + wy)
-        m10 = 2 * (xy + wz)
-        m11 = ww - xx + yy - zz
-        m12 = 2 * (yz - wx)
-        m20 = 2 * (xz - wy)
-        m21 = 2 * (yz + wx)
-        m22 = ww - xx - yy + zz
-
-        return torch.stack(
-            [
-                torch.stack([m00, m01, m02], dim=-1),
-                torch.stack([m10, m11, m12], dim=-1),
-                torch.stack([m20, m21, m22], dim=-1),
-            ],
-            dim=-2,
-        )
-
-    @staticmethod
-    def _matrix_to_quat_wxyz(rot: torch.Tensor) -> torch.Tensor:
-        """rot: (...,3,3) -> (...,4) in wxyz."""
-        m00 = rot[..., 0, 0]
-        m11 = rot[..., 1, 1]
-        m22 = rot[..., 2, 2]
-
-        trace = m00 + m11 + m22
-        q = torch.zeros((*rot.shape[:-2], 4), dtype=rot.dtype, device=rot.device)
-
-        cond = trace > 0
-        s = torch.sqrt(torch.clamp(trace[cond] + 1.0, min=1e-12)) * 2.0
-        q[cond, 0] = 0.25 * s
-        q[cond, 1] = (rot[cond, 2, 1] - rot[cond, 1, 2]) / s
-        q[cond, 2] = (rot[cond, 0, 2] - rot[cond, 2, 0]) / s
-        q[cond, 3] = (rot[cond, 1, 0] - rot[cond, 0, 1]) / s
-
-        cond1 = (~cond) & (m00 > m11) & (m00 > m22)
-        s1 = torch.sqrt(torch.clamp(1.0 + m00[cond1] - m11[cond1] - m22[cond1], min=1e-12)) * 2.0
-        q[cond1, 0] = (rot[cond1, 2, 1] - rot[cond1, 1, 2]) / s1
-        q[cond1, 1] = 0.25 * s1
-        q[cond1, 2] = (rot[cond1, 0, 1] + rot[cond1, 1, 0]) / s1
-        q[cond1, 3] = (rot[cond1, 0, 2] + rot[cond1, 2, 0]) / s1
-
-        cond2 = (~cond) & (~cond1) & (m11 > m22)
-        s2 = torch.sqrt(torch.clamp(1.0 + m11[cond2] - m00[cond2] - m22[cond2], min=1e-12)) * 2.0
-        q[cond2, 0] = (rot[cond2, 0, 2] - rot[cond2, 2, 0]) / s2
-        q[cond2, 1] = (rot[cond2, 0, 1] + rot[cond2, 1, 0]) / s2
-        q[cond2, 2] = 0.25 * s2
-        q[cond2, 3] = (rot[cond2, 1, 2] + rot[cond2, 2, 1]) / s2
-
-        cond3 = (~cond) & (~cond1) & (~cond2)
-        s3 = torch.sqrt(torch.clamp(1.0 + m22[cond3] - m00[cond3] - m11[cond3], min=1e-12)) * 2.0
-        q[cond3, 0] = (rot[cond3, 1, 0] - rot[cond3, 0, 1]) / s3
-        q[cond3, 1] = (rot[cond3, 0, 2] + rot[cond3, 2, 0]) / s3
-        q[cond3, 2] = (rot[cond3, 1, 2] + rot[cond3, 2, 1]) / s3
-        q[cond3, 3] = 0.25 * s3
-
-        q = q / torch.clamp(torch.linalg.norm(q, dim=-1, keepdim=True), min=1e-8)
-        return q
-
-    @staticmethod
-    def _matrix_to_rotvec(rot: torch.Tensor) -> torch.Tensor:
-        """Log map SO(3): (...,3,3) -> (...,3)."""
-        trace = rot[..., 0, 0] + rot[..., 1, 1] + rot[..., 2, 2]
-        cos_theta = torch.clamp((trace - 1.0) * 0.5, -1.0 + 1e-6, 1.0 - 1e-6)
-        theta = torch.acos(cos_theta)
-
-        vee = torch.stack(
-            [
-                rot[..., 2, 1] - rot[..., 1, 2],
-                rot[..., 0, 2] - rot[..., 2, 0],
-                rot[..., 1, 0] - rot[..., 0, 1],
-            ],
-            dim=-1,
-        )
-
-        sin_theta = torch.sin(theta)
-        scale = torch.where(
-            torch.abs(theta) > 1e-4,
-            theta / torch.clamp(2.0 * sin_theta, min=1e-8),
-            0.5 + theta * theta / 12.0,
-        )
-        return scale.unsqueeze(-1) * vee
-
     @staticmethod
     def _inv_se3(mat: torch.Tensor) -> torch.Tensor:
         rot = mat[..., :3, :3]
@@ -267,10 +124,6 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         out[..., :3, 3] = -(rot_t @ pos.unsqueeze(-1)).squeeze(-1)
         out[..., 3, 3] = 1.0
         return out
-
-    def _action_scale(self, ref_tensor: torch.Tensor) -> torch.Tensor:
-        scale = self.normalizer["action"].params_dict["scale"].to(device=ref_tensor.device, dtype=ref_tensor.dtype)
-        return scale.view(1, 1, -1)
 
     # ===========================
     # Pose conversions
@@ -317,7 +170,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         B = episode_start_pose.shape[0]
         start_pos = episode_start_pose[:, :3]
         start_rot = axis_angle_to_matrix(episode_start_pose[:, 3:6])
-        start_quat = self._matrix_to_quat_wxyz(start_rot)
+        start_quat = matrix_to_quaternion(start_rot)
 
         seed = torch.zeros((B, self._robot_dof), device=episode_start_pose.device, dtype=episode_start_pose.dtype)
         goal_pose = Pose(position=start_pos, quaternion=start_quat)
@@ -339,7 +192,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
     ) -> torch.Tensor:
         B, T, _ = abs_pos.shape
         pos_flat = abs_pos.reshape(-1, 3)
-        quat_flat = self._matrix_to_quat_wxyz(abs_rot.reshape(-1, 3, 3))
+        quat_flat = matrix_to_quaternion(abs_rot.reshape(-1, 3, 3))
         seed_flat = seed_q.reshape(-1, self._robot_dof).contiguous()
 
         goal_pose = Pose(position=pos_flat, quaternion=quat_flat)
@@ -370,7 +223,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         else:
             quat_flat = kin_state.ee_pose.quaternion
 
-        rot_flat = self._quat_wxyz_to_matrix(quat_flat)
+        rot_flat = quaternion_to_matrix(quat_flat)
         pos = pos_flat.reshape(B, T, 3)
         rot = rot_flat.reshape(B, T, 3, 3)
         return pos, rot
@@ -404,46 +257,6 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         dq = (j_t @ y).squeeze(-1)  # (N,D)
         return dq
 
-    # ===========================
-    # Core mapping utilities
-    # ===========================
-    def _joint_action_to_relative_cartesian(
-        self,
-        joint_action: torch.Tensor,
-        episode_start_pose: torch.Tensor,
-    ) -> torch.Tensor:
-        q_arm = joint_action[..., : self._robot_dof]
-        grip = joint_action[..., self._robot_dof : self._robot_dof + 1]
-        abs_pos, abs_rot = self._fk_to_absolute(q_arm)
-        rel_pose9 = self._absolute_pose_to_relative9(abs_pos, abs_rot, episode_start_pose)
-        return torch.cat([rel_pose9, grip], dim=-1)
-
-    def _joint_action_to_absolute_pose9(
-        self,
-        joint_action: torch.Tensor,
-    ) -> torch.Tensor:
-        q_arm = joint_action[..., : self._robot_dof]
-        abs_pos, abs_rot = self._fk_to_absolute(q_arm)
-        abs_rot6d = matrix_to_rot6d(abs_rot.reshape(-1, 3, 3)).reshape(*abs_rot.shape[:2], 6)
-        return torch.cat([abs_pos, abs_rot6d], dim=-1)
-
-    def _pose_eps9_to_twist6(self, rel_pose9: torch.Tensor, eps_pose9: torch.Tensor) -> torch.Tensor:
-        """
-        Convert 9D pose perturbation (xyz + 6d-rot repr space) to local SE(3) 6D twist.
-        """
-        b, t, _ = rel_pose9.shape
-        cur_flat = rel_pose9.reshape(-1, 9)
-        nxt_flat = (rel_pose9 + eps_pose9).reshape(-1, 9)
-
-        t_cur = pose9d_to_mat(cur_flat)
-        t_nxt = pose9d_to_mat(nxt_flat)
-        t_delta = t_nxt @ self._inv_se3(t_cur)
-
-        dpos = t_delta[:, :3, 3]
-        drot = self._matrix_to_rotvec(t_delta[:, :3, :3])
-        twist = torch.cat([dpos, drot], dim=-1).reshape(b, t, 6)
-        return twist
-
     def _absolute_pose_delta_to_twist6(
         self,
         abs_pose9_curr: torch.Tensor,
@@ -462,7 +275,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         t_delta = t_tgt @ self._inv_se3(t_cur)
 
         dpos = t_delta[:, :3, 3]
-        drot = self._matrix_to_rotvec(t_delta[:, :3, :3])
+        drot = matrix_to_axis_angle(t_delta[:, :3, :3])
         return torch.cat([dpos, drot], dim=-1).reshape(b, t, 6)
 
     # ===========================
