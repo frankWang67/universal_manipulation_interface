@@ -57,9 +57,11 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         ik_refine_each_step: bool = False,
         ik_position_threshold: float = 5e-4,
         ik_rotation_threshold: float = 5e-3,
-        init_noise_scale: float = 0.3,
+        init_noise_scale: float = 0.2,
         max_dq_per_step: float = 0.5,
         ik_refine_last_step: bool = False,
+        noise_init_mode: str = "jacobian_projected",
+        jac_noise_alpha: float = 0.1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -76,6 +78,11 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         self.init_noise_scale = float(init_noise_scale)
         self.max_dq_per_step = float(max_dq_per_step)
         self.ik_refine_last_step = bool(ik_refine_last_step)
+        self.noise_init_mode = str(noise_init_mode)
+        self.jac_noise_alpha = float(jac_noise_alpha)
+
+        assert self.noise_init_mode in ("isotropic", "jacobian_projected", "jacobian_diagonal"), \
+            f"Unknown noise_init_mode: {self.noise_init_mode}"
 
         self._ik_solver = None
         self._kin_model = None
@@ -326,12 +333,59 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         trajectory_cart = self.normalizer["action"].unnormalize(trajectory_cart_n)
         grip = trajectory_cart[..., 9:10]
 
-        # Direct joint noise: small σ keeps joints in the well-
-        # conditioned neighborhood of q_seed where the Jacobian
-        # linearization is accurate.
-        q_arm = q_seed + torch.randn(
-            q_seed.shape, device=q_seed.device, dtype=q_seed.dtype,
-        ) * self.init_noise_scale
+        # Initialize joint noise according to the selected mode.
+        if self.noise_init_mode == "jacobian_projected":
+            # Jacobian-projected noise: δq = α · J^+(q₀) · ε, ε ~ N(0, I₆)
+            # This shapes noise according to the robot's kinematic structure:
+            # joints with high task-space sensitivity get less noise, and
+            # the overall covariance is Cov(δq) = α² · J^+(J^+)^T.
+            jac_init = self._jacobian(q_seed)  # (B*T, 6, D)
+            eps_twist = torch.randn(
+                (bsz * horizon, 6),
+                device=q_seed.device, dtype=q_seed.dtype,
+                generator=generator,
+            )
+            dq_init = self._dls_pinv_map(eps_twist, jac_init)  # (B*T, D)
+            dq_init = dq_init.reshape(bsz, horizon, self._robot_dof)
+            if self.max_dq_per_step > 0:
+                dq_init = torch.clamp(
+                    dq_init, -self.max_dq_per_step, self.max_dq_per_step
+                )
+            q_arm = q_seed + dq_init * self.jac_noise_alpha
+
+        elif self.noise_init_mode == "jacobian_diagonal":
+            # Jacobian-diagonal noise: use per-joint std from diag(Σ_q),
+            # normalized so mean std = jac_noise_alpha.
+            # Preserves per-joint anisotropy without correlations.
+            jac_init = self._jacobian(q_seed)  # (B*T, 6, D)
+            jt = jac_init.transpose(-2, -1)  # (N, D, 6)
+            jjt = jac_init @ jt  # (N, 6, 6)
+            eye6 = torch.eye(6, device=jac_init.device, dtype=jac_init.dtype).unsqueeze(0)
+            Jpinv = torch.linalg.solve(
+                jjt + self.jacobian_damping * eye6, jac_init
+            ).transpose(-2, -1)  # (N, D, 6)
+            Sigma_q = Jpinv @ Jpinv.transpose(-2, -1)  # (N, D, D)
+            per_joint_std = torch.sqrt(
+                torch.clamp(torch.diagonal(Sigma_q, dim1=-2, dim2=-1), min=1e-8)
+            )  # (N, D)
+            # Normalize so mean per-joint std = jac_noise_alpha
+            mean_std = per_joint_std.mean(dim=-1, keepdim=True)
+            per_joint_std = per_joint_std / mean_std * self.jac_noise_alpha
+            per_joint_std = per_joint_std.reshape(bsz, horizon, self._robot_dof)
+            q_arm = q_seed + torch.randn(
+                q_seed.shape, device=q_seed.device, dtype=q_seed.dtype,
+                generator=generator,
+            ) * per_joint_std
+
+        else:  # isotropic (original behavior)
+            # Direct joint noise: small σ keeps joints in the well-
+            # conditioned neighborhood of q_seed where the Jacobian
+            # linearization is accurate.
+            q_arm = q_seed + torch.randn(
+                q_seed.shape, device=q_seed.device, dtype=q_seed.dtype,
+                generator=generator,
+            ) * self.init_noise_scale
+
         q_traj = torch.cat([q_arm, grip], dim=-1)
 
         # ── 3) Precompute conditioned joint targets (for inpainting) ────
