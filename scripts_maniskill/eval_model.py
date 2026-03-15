@@ -17,6 +17,7 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from omegaconf import open_dict
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from umi.real_world.real_inference_util import (
@@ -49,6 +50,11 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--harder', is_flag=True, help="Whether to use harder environment setting with more obstacles and narrower workspace.")
 @click.option('--add_guidance', is_flag=True, help="Whether to add obstacle avoidance guidance during inference.")
 @click.option('--joint_space', is_flag=True, help="Whether the policy is a joint space diffusion policy.")
+@click.option('--joint_space_guidance', is_flag=True, help="Whether to use joint-space policy with whole-body collision guidance.")
+@click.option('--guidance_scale', default=1.0, type=float, help="Guidance scale for joint-space whole-body collision guidance.")
+@click.option('--guidance_safety_margin', default=0.05, type=float, help="Safety margin (meters) used in collision guidance loss.")
+@click.option('--guidance_activation_distance', default=10.0, type=float, help="Activation distance (meters) for cuRobo SDF query.")
+@click.option('--guidance_grad_clip', default=0.25, type=float, help="Per-step gradient clip for joint-space guidance.")
 def main(
     input, 
     ckpt_filename, 
@@ -65,24 +71,65 @@ def main(
     harder,
     add_guidance,
     joint_space,
+    joint_space_guidance,
+    guidance_scale,
+    guidance_safety_margin,
+    guidance_activation_distance,
+    guidance_grad_clip,
 ):
     # load checkpoint
     exp_path = input
-    ckpt_path = os.path.join(exp_path, 'ckpt', ckpt_filename)
-    if not ckpt_path.endswith('.ckpt'):
-        ckpt_path = ckpt_path + '.ckpt'
+    if os.path.isfile(input):
+        ckpt_path = input
+        exp_path = os.path.dirname(os.path.dirname(ckpt_path))
+    else:
+        ckpt_path = os.path.join(exp_path, 'ckpt', ckpt_filename)
+        if not (ckpt_path.endswith('.ckpt') or ckpt_path.endswith('.pth')):
+            ckpt_path_ckpt = ckpt_path + '.ckpt'
+            ckpt_path_pth = ckpt_path + '.pth'
+            if os.path.exists(ckpt_path_ckpt):
+                ckpt_path = ckpt_path_ckpt
+            elif os.path.exists(ckpt_path_pth):
+                ckpt_path = ckpt_path_pth
+            else:
+                ckpt_path = ckpt_path_ckpt
     assert os.path.exists(ckpt_path), f"Checkpoint {ckpt_path} does not exist."
     payload = torch.load(open(ckpt_path, 'rb'), map_location='cpu', pickle_module=dill)
     cfg = payload['cfg']
-    if add_guidance:
+
+    robot_cfg_name_map = {
+        'panda_robotiq_wristcam': 'panda_robotiq_wristcam.yml',
+        'ur5_robotiq_wristcam': 'ur5_robotiq_wristcam.yml',
+        'xarm6_robotiq_wristcam': 'xarm6_robotiq_wristcam.yml',
+        'xarm7_robotiq_wristcam': 'xarm7_robotiq_wristcam.yml',
+        'floating_robotiq_2f_85_gripper_wristcam': 'floating_robotiq_wristcam.yml',
+    }
+
+    if joint_space_guidance:
+        cfg.policy._target_ = (
+            'diffusion_policy.policy.diffusion_unet_timm_policy_joint_space_with_guidance.'
+            'DiffusionUnetTimmPolicyJointSpaceWithGuidance'
+        )
+        with open_dict(cfg.policy):
+            cfg.policy.robot_uid = robot_uids
+            cfg.policy.robot_cfg_name = robot_cfg_name_map.get(robot_uids, f'{robot_uids}.yml')
+            cfg.policy.guidance_scale = guidance_scale
+            cfg.policy.guidance_safety_margin = guidance_safety_margin
+            cfg.policy.guidance_activation_distance = guidance_activation_distance
+            cfg.policy.guidance_grad_clip = guidance_grad_clip
+    elif add_guidance:
         cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_with_guidance.DiffusionUnetTimmPolicyWithGuidance"
-    if joint_space:
+    elif joint_space:
         cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_joint_space.DiffusionUnetTimmPolicyJointSpace"
+        with open_dict(cfg.policy):
+            cfg.policy.robot_cfg_name = robot_cfg_name_map.get(robot_uids, f'{robot_uids}.yml')
     print("model_name:", cfg.policy.obs_encoder.model_name)
     print("dataset_path:", cfg.task.dataset.dataset_path)
 
     video_dir = os.path.join(exp_path, 'eval_results', robot_uids)
-    if add_guidance:
+    if joint_space_guidance:
+        video_dir = os.path.join(video_dir, 'joint_space_whole_body_guidance')
+    elif add_guidance:
         video_dir = os.path.join(video_dir, 'guided_diffusion')
     elif harder:
         video_dir = os.path.join(video_dir, 'without_guidance')
@@ -95,7 +142,7 @@ def main(
         render_mode=render_mode,
         max_episode_steps=max_episode_steps,
     )
-    if harder or add_guidance:
+    if harder or add_guidance or joint_space_guidance:
         env_kwargs['harder'] = True
     other_kwargs = dict(obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon)
     env = make_eval_envs(
@@ -146,7 +193,7 @@ def main(
         )
         obs_dict = dict_apply(obs_dict_np, 
             lambda x: torch.from_numpy(x).to(device))
-        if add_guidance or joint_space:
+        if add_guidance or joint_space or joint_space_guidance:
             episode_start_pose_tensor = torch.from_numpy(episode_start_pose[0]).to(device)
         else:
             episode_start_pose_tensor = None
@@ -159,7 +206,10 @@ def main(
 
     print('Ready! Start evaluation.')
     eval_metrics = evaluate(
-        num_eval_episodes, cfg, policy, env, steps_per_inference, add_guidance, joint_space, device, 
+        num_eval_episodes, cfg, policy, env, steps_per_inference,
+        (add_guidance or joint_space_guidance),
+        (joint_space or joint_space_guidance),
+        device,
     )
     print("Evaluation results over {} episodes:".format(num_eval_episodes))
     success_once_rate = np.mean(eval_metrics["success_once"])
@@ -168,7 +218,9 @@ def main(
     print(f"{success_at_end_rate=}")
 
     log_dir = os.path.join(exp_path, 'eval_results', robot_uids)
-    if add_guidance:
+    if joint_space_guidance:
+        log_dir = os.path.join(log_dir, 'joint_space_whole_body_guidance')
+    elif add_guidance:
         log_dir = os.path.join(log_dir, 'guided_diffusion')
     elif harder:
         log_dir = os.path.join(log_dir, 'without_guidance')
