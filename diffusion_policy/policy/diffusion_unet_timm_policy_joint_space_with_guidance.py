@@ -17,19 +17,9 @@ from curobo.util_file import get_robot_configs_path, get_assets_path, join_path,
 
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.common.guided_diffusion_util import get_guidance_strength, flatten_obstacle_info
-from diffusion_policy.policy.diffusion_unet_timm_policy_joint_space import (
-    DiffusionUnetTimmPolicyJointSpace,
-    pose9d_to_mat,
-)
+from diffusion_policy.policy.diffusion_unet_timm_policy_joint_space import DiffusionUnetTimmPolicyJointSpace
 
-from mani_skill.utils.geometry.rotation_conversions import (
-    axis_angle_to_matrix,
-    matrix_to_axis_angle,
-    matrix_to_quaternion,
-    matrix_to_rotation_6d as matrix_to_rot6d,
-    quaternion_to_matrix,
-    rotation_6d_to_matrix as rot6d_to_matrix,
-)
+from mani_skill.utils.geometry.rotation_conversions import matrix_to_rotation_6d as matrix_to_rot6d
 
 
 class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJointSpace):
@@ -50,14 +40,14 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         robot_urdf_path: Optional[str] = None,
         ee_link_name: Optional[str] = None,
         arm_dof: int = -1,
-        guidance_scale: float = 0.08,
-        guidance_safety_margin: float = 0.02,
-        guidance_activation_distance: float = 0.08,
-        guidance_grad_clip: float = 0.25,
-        guidance_loss_power: float = 1.0,
+        guidance_scale: float = 0.01,
+        guidance_safety_margin: float = 0.01,
+        guidance_activation_distance: float = 0.01,
+        guidance_grad_clip: float = 1.0,
+        guidance_loss_power: float = 2.0,
         guidance_use_schedule: bool = True,
         guidance_apply_last_step_only: bool = False,
-        guidance_steps_per_denoise: int = 1,
+        guidance_steps_per_denoise: int = 2,
         **kwargs,
     ):
         if robot_cfg_name is None:
@@ -157,37 +147,13 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         if self.arm_dof <= 0:
             self.arm_dof = int(self._pk_chain.n_joints)
 
-    def _normalize_obstacle_info(self, obstacle_info: Any) -> List[Dict[str, torch.Tensor]]:
-        if obstacle_info is None:
-            return []
-        if isinstance(obstacle_info, tuple):
-            obstacle_info = list(obstacle_info)
-        if isinstance(obstacle_info, list) and len(obstacle_info) == 0:
-            return []
-
-        obstacles = obstacle_info
-        if isinstance(obstacles, list) and len(obstacles) > 0 and isinstance(obstacles[0], list):
-            obstacles = flatten_obstacle_info(obstacles)
-
-        if not isinstance(obstacles, list):
-            raise TypeError(f"Unsupported obstacle_info type: {type(obstacle_info)}")
-        if len(obstacles) == 0:
-            return []
-
-        out = []
-        for obs in obstacles:
-            if not all(k in obs for k in ("center", "quat", "extent")):
-                continue
-            out.append(obs)
-        return out
-
     def _build_world_collision(
         self,
         obstacle_info: Any,
         device: torch.device,
         dtype: torch.dtype,
     ):
-        obstacles = self._normalize_obstacle_info(obstacle_info)
+        obstacles = flatten_obstacle_info(obstacle_info) if obstacle_info is not None else []
         if len(obstacles) == 0:
             self._world_collision = None
             self._coll_query_buffer = None
@@ -274,11 +240,15 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         if not self.guidance_use_schedule:
             return scale
 
+        # Guidance should be stronger at late denoising steps, when samples are
+        # close to the data manifold and less likely to be washed out.
+        # get_guidance_strength() is monotonic in k where small k -> strong,
+        # thus we map idx (0->start) to k (large->start, small->end).
         if n_steps <= 1:
             k = torch.tensor(0.0, device=device, dtype=dtype)
             n = torch.tensor(1.0, device=device, dtype=dtype)
         else:
-            k = torch.tensor(float(idx), device=device, dtype=dtype)
+            k = torch.tensor(float((n_steps - 1) - idx), device=device, dtype=dtype)
             n = torch.tensor(float(n_steps - 1), device=device, dtype=dtype)
         return scale * get_guidance_strength(k, n)
 
@@ -307,7 +277,10 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                 return_loss=False,
                 compute_esdf=True,
             )
-            loss = self._collision_penalty(dist).mean()
+            penalty = self._collision_penalty(dist)
+            # Avoid gradient dilution from averaging over all spheres and time.
+            # Sum over horizon/spheres, then average over batch.
+            loss = penalty.reshape(B, -1).sum(dim=-1).mean()
             grad = torch.autograd.grad(loss, q_req, allow_unused=True)[0]
             if grad is None:
                 grad = torch.zeros_like(q_req)
@@ -491,12 +464,12 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                     timing["guidance_grad"] += time.perf_counter() - tg
 
                     ta = time.perf_counter()
-                    grad_norm = torch.linalg.norm(grad.reshape(bsz, -1), dim=-1, keepdim=True)
-                    grad_norm = grad_norm.unsqueeze(-1)
                     if self.guidance_grad_clip > 0:
-                        safe_norm = torch.clamp(grad_norm, min=1e-8)
-                        clip = torch.clamp(self.guidance_grad_clip / safe_norm, max=1.0)
-                        grad = grad * clip
+                        grad = torch.clamp(
+                            grad,
+                            min=-self.guidance_grad_clip,
+                            max=self.guidance_grad_clip,
+                        )
 
                     gamma = self._guidance_scale_at(
                         idx=idx,
