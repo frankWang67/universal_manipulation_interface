@@ -16,7 +16,11 @@ from curobo.geom.types import WorldConfig, Cuboid
 from curobo.util_file import get_robot_configs_path, get_assets_path, join_path, load_yaml
 
 from diffusion_policy.common.pytorch_util import dict_apply
-from diffusion_policy.common.guided_diffusion_util import get_guidance_strength, flatten_obstacle_info
+from diffusion_policy.common.guided_diffusion_util import (
+    get_guidance_strength,
+    flatten_obstacle_info,
+    get_pred_x0,
+)
 from diffusion_policy.policy.diffusion_unet_timm_policy_joint_space import DiffusionUnetTimmPolicyJointSpace
 
 from mani_skill.utils.geometry.rotation_conversions import matrix_to_rotation_6d as matrix_to_rot6d
@@ -41,13 +45,14 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         ee_link_name: Optional[str] = None,
         arm_dof: int = -1,
         guidance_scale: float = 0.01,
-        guidance_safety_margin: float = 0.01,
-        guidance_activation_distance: float = 0.01,
+        guidance_safety_margin: float = 0.02,
+        guidance_activation_distance: float = 0.02,
         guidance_grad_clip: float = 1.0,
         guidance_loss_power: float = 2.0,
         guidance_use_schedule: bool = True,
         guidance_apply_last_step_only: bool = False,
-        guidance_steps_per_denoise: int = 2,
+        guidance_steps_per_denoise: int = 1,
+        guidance_use_clean_sample: bool = True,
         **kwargs,
     ):
         if robot_cfg_name is None:
@@ -71,6 +76,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         self.guidance_use_schedule = bool(guidance_use_schedule)
         self.guidance_apply_last_step_only = bool(guidance_apply_last_step_only)
         self.guidance_steps_per_denoise = int(max(guidance_steps_per_denoise, 1))
+        self.guidance_use_clean_sample = bool(guidance_use_clean_sample)
 
         self._world_collision = None
         self._coll_query_buffer = None
@@ -153,7 +159,10 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         device: torch.device,
         dtype: torch.dtype,
     ):
-        obstacles = flatten_obstacle_info(obstacle_info) if obstacle_info is not None else []
+        if obstacle_info is None:
+            obstacles = []
+        else:
+            obstacles = flatten_obstacle_info(obstacle_info)
         if len(obstacles) == 0:
             self._world_collision = None
             self._coll_query_buffer = None
@@ -286,6 +295,40 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                 grad = torch.zeros_like(q_req)
             return grad.detach(), loss.detach()
 
+    def _estimate_clean_joint_from_cartesian(
+        self,
+        q_arm_ref: torch.Tensor,
+        cart_phys_clean: torch.Tensor,
+        episode_start_pose: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Approximate clean joint sample using one Jacobian linearization step.
+        This keeps one-step efficiency while avoiding guidance on very noisy q.
+        """
+        bsz, horizon, _ = q_arm_ref.shape
+
+        # current absolute pose from reference joint trajectory
+        abs_pos_ref, abs_rot_ref = self._fk_to_absolute(q_arm_ref)
+        abs_rot6d_ref = matrix_to_rot6d(abs_rot_ref.reshape(-1, 3, 3)).reshape(bsz, horizon, 6)
+        abs_pose9_ref = torch.cat([abs_pos_ref, abs_rot6d_ref], dim=-1)
+
+        # target absolute pose from predicted clean Cartesian sample
+        abs_pos_clean, abs_rot_clean = self._relative_pose9_to_absolute(
+            cart_phys_clean[..., :9], episode_start_pose
+        )
+        abs_rot6d_clean = matrix_to_rot6d(abs_rot_clean.reshape(-1, 3, 3)).reshape(bsz, horizon, 6)
+        abs_pose9_clean = torch.cat([abs_pos_clean, abs_rot6d_clean], dim=-1)
+
+        twist_to_clean = self._absolute_pose_delta_to_twist6(abs_pose9_ref, abs_pose9_clean)
+        jac_ref = self._jacobian(q_arm_ref)
+        dq_clean = self._dls_pinv_map(
+            twist_to_clean.reshape(-1, 6), jac_ref
+        ).reshape(bsz, horizon, self._robot_dof)
+        if self.max_dq_per_step > 0:
+            dq_clean = torch.clamp(dq_clean, -self.max_dq_per_step, self.max_dq_per_step)
+        q_arm_clean = q_arm_ref + dq_clean
+        return q_arm_clean
+
     def conditional_sample(
         self,
         condition_data,
@@ -395,6 +438,8 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             "step_cart_l2": [],
             "guidance_loss": [],
             "guidance_grad_norm": [],
+            "clean_sample_cart_err_before": [],
+            "clean_sample_cart_err_after": [],
         }
         timesteps = list(scheduler.timesteps)
         n_steps = len(timesteps)
@@ -413,6 +458,19 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             cart_n_curr[condition_mask] = condition_data[condition_mask]
 
             eps_cart_n = model(cart_n_curr, t, local_cond=local_cond, global_cond=global_cond)
+
+            # Predicted clean Cartesian sample x0 in normalized action space.
+            pred_type = self.noise_scheduler.config.prediction_type
+            if pred_type == "epsilon":
+                alpha_prod_t = self.noise_scheduler.alphas_cumprod[t]
+                alpha_prod_t = alpha_prod_t.to(device=cart_n_curr.device, dtype=cart_n_curr.dtype)
+                cart_n_clean = get_pred_x0(eps_cart_n, cart_n_curr, alpha_prod_t)
+            elif pred_type == "sample":
+                cart_n_clean = eps_cart_n
+            else:
+                cart_n_clean = cart_n_curr
+            cart_n_clean[condition_mask] = condition_data[condition_mask]
+            cart_phys_clean = self.normalizer["action"].unnormalize(cart_n_clean)
 
             cart_n_prev_tgt = scheduler.step(
                 eps_cart_n, t, cart_n_curr, generator=generator, **kwargs
@@ -458,10 +516,25 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
 
             if apply_guidance:
                 t0 = time.perf_counter()
+
+                if self.guidance_use_clean_sample:
+                    q_guidance_state = self._estimate_clean_joint_from_cartesian(
+                        q_arm_ref=q_arm_new,
+                        cart_phys_clean=cart_phys_clean,
+                        episode_start_pose=episode_start_pose,
+                    )
+                else:
+                    q_guidance_state = q_arm_new
+
                 for _ in range(self.guidance_steps_per_denoise):
                     tg = time.perf_counter()
-                    grad, guide_loss = self._compute_collision_grad(q_arm_new)
+                    grad, guide_loss = self._compute_collision_grad(q_guidance_state)
                     timing["guidance_grad"] += time.perf_counter() - tg
+
+                    # Do not perturb conditioned prefix steps.
+                    if torch.any(cond_step_mask):
+                        grad = grad.clone()
+                        grad[cond_step_mask] = 0.0
 
                     ta = time.perf_counter()
                     if self.guidance_grad_clip > 0:
@@ -479,6 +552,8 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                         device=q_arm_new.device,
                     )
                     q_arm_new = q_arm_new - gamma * grad
+                    # Keep guidance linearization state synchronized.
+                    q_guidance_state = q_guidance_state - gamma * grad
                     timing["guidance_apply"] += time.perf_counter() - ta
 
                     if return_debug:
@@ -487,6 +562,23 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                             torch.linalg.norm(grad.reshape(bsz, -1), dim=-1).detach().cpu()
                         )
                 timing["guidance_total"] += time.perf_counter() - t0
+
+                if return_debug and self.guidance_use_clean_sample:
+                    abs_p_before, abs_r_before = self._fk_to_absolute(q_arm_new + gamma * grad)
+                    rel9_before = self._absolute_pose_to_relative9(abs_p_before, abs_r_before, episode_start_pose)
+                    cart_before = torch.cat([rel9_before, cart_phys_prev_tgt[..., 9:10]], dim=-1)
+                    err_before = torch.linalg.norm(
+                        (cart_before[..., :9] - cart_phys_clean[..., :9]).reshape(bsz, -1), dim=-1
+                    )
+
+                    abs_p_after, abs_r_after = self._fk_to_absolute(q_arm_new)
+                    rel9_after = self._absolute_pose_to_relative9(abs_p_after, abs_r_after, episode_start_pose)
+                    cart_after = torch.cat([rel9_after, cart_phys_prev_tgt[..., 9:10]], dim=-1)
+                    err_after = torch.linalg.norm(
+                        (cart_after[..., :9] - cart_phys_clean[..., :9]).reshape(bsz, -1), dim=-1
+                    )
+                    debug["clean_sample_cart_err_before"].append(err_before.detach().cpu())
+                    debug["clean_sample_cart_err_after"].append(err_after.detach().cpu())
 
             q_traj = torch.cat([q_arm_new, cart_phys_prev_tgt[..., 9:10]], dim=-1)
 
