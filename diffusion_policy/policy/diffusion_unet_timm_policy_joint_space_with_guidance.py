@@ -45,14 +45,14 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         ee_link_name: Optional[str] = None,
         arm_dof: int = -1,
         guidance_scale: float = 0.01,
-        guidance_safety_margin: float = 0.02,
+        guidance_safety_margin: float = 0.01,
         guidance_activation_distance: float = 0.02,
         guidance_grad_clip: float = 1.0,
         guidance_loss_power: float = 2.0,
         guidance_use_schedule: bool = True,
         guidance_apply_last_step_only: bool = False,
         guidance_steps_per_denoise: int = 1,
-        guidance_use_clean_sample: bool = True,
+        guidance_use_clean_sample: bool = False,
         **kwargs,
     ):
         if robot_cfg_name is None:
@@ -286,10 +286,17 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                 return_loss=False,
                 compute_esdf=True,
             )
-            penalty = self._collision_penalty(dist)
-            # Avoid gradient dilution from averaging over all spheres and time.
-            # Sum over horizon/spheres, then average over batch.
-            loss = penalty.reshape(B, -1).sum(dim=-1).mean()
+            # Worst-case aggregation for each parallel environment sample:
+            # cuRobo ESDF sign convention here is positive inside obstacle,
+            # negative outside; therefore "closest" in physical sense is the
+            # maximum signed distance value.
+            dist_worst = dist.max(dim=-1).values
+            penalty = self._collision_penalty(dist_worst)
+
+            # Batch dimension is only for parallelism; do not average across B.
+            # Summation preserves independent per-sample gradients without
+            # introducing 1/B scaling.
+            loss = penalty.sum().sum()
             grad = torch.autograd.grad(loss, q_req, allow_unused=True)[0]
             if grad is None:
                 grad = torch.zeros_like(q_req)
