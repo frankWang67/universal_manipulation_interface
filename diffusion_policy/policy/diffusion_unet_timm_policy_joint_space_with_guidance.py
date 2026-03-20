@@ -30,10 +30,17 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
     """
     Joint-space diffusion with whole-body collision guidance.
 
-    Guidance is applied in joint space after each reverse DDPM step:
-        q_{t-1}^{guided} = q_{t-1} - gamma_t * dL_col/dq
+    Guidance is applied as a batched CBF-QP in joint space after each reverse DDPM
+    step. For each trajectory state q^o, solve:
 
-    where L_col is computed from cuRobo ESDF queried at robot body collision spheres.
+        min_{Δq} 1/2 * Δq^T (J_pos^T J_pos + λI) Δq
+        s.t.      ∇h(q^o)^T Δq >= d_safe - h(q^o)
+
+    where:
+      - J_pos is the translational Jacobian block (top-3 rows),
+      - h is a CBF-style safety function mapped from cuRobo ESDF
+        (h >= 0 means safe),
+      - d_safe is guidance_safety_margin.
     """
 
     def __init__(
@@ -44,7 +51,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         robot_urdf_path: Optional[str] = None,
         ee_link_name: Optional[str] = None,
         arm_dof: int = -1,
-        guidance_scale: float = 0.01,
+        guidance_scale: float = 1.0,
         guidance_safety_margin: float = 0.01,
         guidance_activation_distance: float = 0.02,
         guidance_grad_clip: float = 1.0,
@@ -53,6 +60,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         guidance_apply_last_step_only: bool = False,
         guidance_steps_per_denoise: int = 1,
         guidance_use_clean_sample: bool = False,
+        guidance_cbf_lambda: float = 0.01,
         **kwargs,
     ):
         if robot_cfg_name is None:
@@ -77,6 +85,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         self.guidance_apply_last_step_only = bool(guidance_apply_last_step_only)
         self.guidance_steps_per_denoise = int(max(guidance_steps_per_denoise, 1))
         self.guidance_use_clean_sample = bool(guidance_use_clean_sample)
+        self.guidance_cbf_lambda = float(guidance_cbf_lambda)
 
         self._world_collision = None
         self._coll_query_buffer = None
@@ -169,8 +178,9 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             self._cached_world_key = None
             return
 
-        # Build world from the first environment's obstacles;
-        # query remains batched over trajectory spheres.
+        # Build world by including obstacles from all parallel environments.
+        # This avoids guidance mismatch when vectorized eval randomizes obstacle
+        # poses per environment.
         world_cuboids = []
         world_key_items = []
         for i, obs in enumerate(obstacles):
@@ -178,43 +188,43 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             quat = obs["quat"]
             extent = obs["extent"]
 
-            if center.ndim == 2:
-                c = center[0]
-            else:
-                c = center
-            if quat.ndim == 2:
-                q = quat[0]
-            else:
-                q = quat
-            if extent.ndim == 2:
-                e = extent[0]
-            else:
-                e = extent
+            if center.ndim == 1:
+                center = center.unsqueeze(0)
+            if quat.ndim == 1:
+                quat = quat.unsqueeze(0)
+            if extent.ndim == 1:
+                extent = extent.unsqueeze(0)
 
-            c = c.to(device=device, dtype=dtype)
-            q = q.to(device=device, dtype=dtype)
-            e = e.to(device=device, dtype=dtype)
-            world_key_items.append(torch.cat([c, q, e], dim=0))
+            center = center.to(device=device, dtype=dtype)
+            quat = quat.to(device=device, dtype=dtype)
+            extent = extent.to(device=device, dtype=dtype)
 
-            world_cuboids.append(
-                Cuboid(
-                    name=f"obs_{i}",
-                    pose=[
-                        float(c[0].item()),
-                        float(c[1].item()),
-                        float(c[2].item()),
-                        float(q[0].item()),
-                        float(q[1].item()),
-                        float(q[2].item()),
-                        float(q[3].item()),
-                    ],
-                    dims=[
-                        float(2.0 * e[0].item()),
-                        float(2.0 * e[1].item()),
-                        float(2.0 * e[2].item()),
-                    ],
+            n_env_obs = int(center.shape[0])
+            for j in range(n_env_obs):
+                c = center[j]
+                q = quat[j if quat.shape[0] > 1 else 0]
+                e = extent[j if extent.shape[0] > 1 else 0]
+                world_key_items.append(torch.cat([c, q, e], dim=0))
+
+                world_cuboids.append(
+                    Cuboid(
+                        name=f"obs_{i}_{j}",
+                        pose=[
+                            float(c[0].item()),
+                            float(c[1].item()),
+                            float(c[2].item()),
+                            float(q[0].item()),
+                            float(q[1].item()),
+                            float(q[2].item()),
+                            float(q[3].item()),
+                        ],
+                        dims=[
+                            float(2.0 * e[0].item()),
+                            float(2.0 * e[1].item()),
+                            float(2.0 * e[2].item()),
+                        ],
+                    )
                 )
-            )
 
         world_key = torch.cat(world_key_items, dim=0)
         if (
@@ -260,6 +270,130 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             k = torch.tensor(float((n_steps - 1) - idx), device=device, dtype=dtype)
             n = torch.tensor(float(n_steps - 1), device=device, dtype=dtype)
         return scale * get_guidance_strength(k, n)
+
+    @staticmethod
+    def _curobo_signed_distance_to_cbf_h(dist_signed: torch.Tensor) -> torch.Tensor:
+        """
+        Map cuRobo signed distance to CBF safety function h(q).
+
+        cuRobo ESDF convention:
+          - positive: inside obstacle (unsafe)
+          - negative: outside obstacle (safe)
+        CBF convention used here:
+          - h >= 0: safe
+
+        Therefore: h = -dist_signed
+        """
+        return -dist_signed
+
+    def _query_worst_signed_distance(self, q_arm: torch.Tensor) -> torch.Tensor:
+        """
+        Returns worst-case cuRobo signed distance over robot collision spheres.
+        Output shape: (B, T)
+        """
+        B, T, D = q_arm.shape
+        q_flat = q_arm.reshape(B * T, D).contiguous()
+        kin_state = self._kin_model.get_state(q_flat)
+        spheres = kin_state.link_spheres_tensor.reshape(B, T, -1, 4)
+
+        self._coll_query_buffer.update_buffer_shape(
+            spheres.shape,
+            self._tensor_args,
+            self._world_collision.collision_types,
+        )
+        dist = self._world_collision.get_sphere_distance(
+            spheres,
+            self._coll_query_buffer,
+            self._coll_weight,
+            self._coll_activation_distance,
+            return_loss=False,
+            compute_esdf=True,
+        )
+        # Worst-case sphere is the max under cuRobo sign convention.
+        return dist.max(dim=-1).values
+
+    def _compute_cbf_linearization(
+        self, q_arm: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute linearized CBF terms at q_arm:
+          h(q^o), ∇h(q^o), and cuRobo worst signed distance.
+        """
+        if self._world_collision is None:
+            zq = torch.zeros_like(q_arm)
+            zh = torch.zeros(q_arm.shape[:2], device=q_arm.device, dtype=q_arm.dtype)
+            return zh, zq, zh
+
+        with torch.enable_grad():
+            q_req = q_arm.detach().clone().requires_grad_(True)
+            dist_worst = self._query_worst_signed_distance(q_req)
+            h = self._curobo_signed_distance_to_cbf_h(dist_worst)
+            grad_h = torch.autograd.grad(h.sum(), q_req, allow_unused=True)[0]
+            if grad_h is None:
+                grad_h = torch.zeros_like(q_req)
+            return h.detach(), grad_h.detach(), dist_worst.detach()
+
+    def _solve_batched_cbf_qp(
+        self,
+        jac_pos: torch.Tensor,
+        grad_h: torch.Tensor,
+        h_value: torch.Tensor,
+        constraint_scale: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Solve batched single-inequality QP in closed form.
+
+        QP:
+          min 1/2 * dq^T H dq, with H = J_pos^T J_pos + λI
+          s.t. grad_h^T dq >= d_safe - h
+        """
+        B, T, _, D = jac_pos.shape
+        N = B * T
+
+        # Solve CBF-QP only in controllable arm subspace.
+        # q includes extra gripper/coupler joints from cuRobo kinematics, but
+        # the policy action only controls the arm DOFs (plus one scalar gripper
+        # command outside this q-space). If unconstrained tail joints are kept
+        # in the QP variable, they can absorb constraint satisfaction and dilute
+        # effective arm correction.
+        ctrl_dof = int(min(max(self.arm_dof, 1), D))
+
+        J = jac_pos[..., :ctrl_dof].reshape(N, 3, ctrl_dof)
+        a = grad_h[..., :ctrl_dof].reshape(N, ctrl_dof)
+        h_flat = h_value.reshape(N)
+
+        if constraint_scale.ndim == 0:
+            c_scale = constraint_scale
+        else:
+            c_scale = constraint_scale.reshape(-1)[0]
+        rhs = (self.guidance_safety_margin - h_flat) * c_scale
+        rhs = torch.clamp(rhs, min=0.0)
+
+        eye = torch.eye(ctrl_dof, device=J.device, dtype=J.dtype).unsqueeze(0)
+        H = J.transpose(-2, -1) @ J + self.guidance_cbf_lambda * eye
+
+        a_col = a.unsqueeze(-1)
+        H_inv_a = torch.linalg.solve(H, a_col).squeeze(-1)
+        denom = (a * H_inv_a).sum(dim=-1)
+
+        eps = torch.tensor(1e-9, device=denom.device, dtype=denom.dtype)
+        feasible = denom > eps
+        alpha = torch.zeros_like(rhs)
+        alpha[feasible] = rhs[feasible] / denom[feasible]
+
+        dq_ctrl = H_inv_a * alpha.unsqueeze(-1)
+        if ctrl_dof == D:
+            dq = dq_ctrl
+        else:
+            dq = torch.zeros((N, D), device=dq_ctrl.device, dtype=dq_ctrl.dtype)
+            dq[:, :ctrl_dof] = dq_ctrl
+
+        return (
+            dq.reshape(B, T, D),
+            rhs.reshape(B, T),
+            denom.reshape(B, T),
+            feasible.reshape(B, T),
+        )
 
     def _compute_collision_grad(self, q_arm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self._world_collision is None:
@@ -533,24 +667,14 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                 else:
                     q_guidance_state = q_arm_new
 
+                q_before_guidance = q_arm_new.clone()
                 for _ in range(self.guidance_steps_per_denoise):
                     tg = time.perf_counter()
-                    grad, guide_loss = self._compute_collision_grad(q_guidance_state)
-                    timing["guidance_grad"] += time.perf_counter() - tg
-
-                    # Do not perturb conditioned prefix steps.
-                    if torch.any(cond_step_mask):
-                        grad = grad.clone()
-                        grad[cond_step_mask] = 0.0
-
-                    ta = time.perf_counter()
-                    if self.guidance_grad_clip > 0:
-                        grad = torch.clamp(
-                            grad,
-                            min=-self.guidance_grad_clip,
-                            max=self.guidance_grad_clip,
-                        )
-
+                    h_value, grad_h, _dist_signed = self._compute_cbf_linearization(q_guidance_state)
+                    jac_lin = self._jacobian(q_guidance_state).reshape(
+                        bsz, horizon, 6, self._robot_dof
+                    )
+                    jac_pos = jac_lin[..., :3, :]
                     gamma = self._guidance_scale_at(
                         idx=idx,
                         n_steps=n_steps,
@@ -558,20 +682,43 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                         dtype=q_arm_new.dtype,
                         device=q_arm_new.device,
                     )
-                    q_arm_new = q_arm_new - gamma * grad
+                    dq_cbf, _rhs, _denom, _feasible = self._solve_batched_cbf_qp(
+                        jac_pos=jac_pos,
+                        grad_h=grad_h,
+                        h_value=h_value,
+                        constraint_scale=gamma,
+                    )
+                    timing["guidance_grad"] += time.perf_counter() - tg
+
+                    # Do not perturb conditioned prefix steps.
+                    if torch.any(cond_step_mask):
+                        dq_cbf = dq_cbf.clone()
+                        dq_cbf[cond_step_mask] = 0.0
+
+                    ta = time.perf_counter()
+                    if self.guidance_grad_clip > 0:
+                        dq_cbf = torch.clamp(
+                            dq_cbf,
+                            min=-self.guidance_grad_clip,
+                            max=self.guidance_grad_clip,
+                        )
+
+                    q_arm_new = q_arm_new + dq_cbf
                     # Keep guidance linearization state synchronized.
-                    q_guidance_state = q_guidance_state - gamma * grad
+                    q_guidance_state = q_guidance_state + dq_cbf
                     timing["guidance_apply"] += time.perf_counter() - ta
 
                     if return_debug:
+                        cbf_violation = torch.relu(self.guidance_safety_margin - h_value)
+                        guide_loss = cbf_violation.sum()
                         debug["guidance_loss"].append(guide_loss.detach().cpu())
                         debug["guidance_grad_norm"].append(
-                            torch.linalg.norm(grad.reshape(bsz, -1), dim=-1).detach().cpu()
+                            torch.linalg.norm(grad_h.reshape(bsz, -1), dim=-1).detach().cpu()
                         )
                 timing["guidance_total"] += time.perf_counter() - t0
 
                 if return_debug and self.guidance_use_clean_sample:
-                    abs_p_before, abs_r_before = self._fk_to_absolute(q_arm_new + gamma * grad)
+                    abs_p_before, abs_r_before = self._fk_to_absolute(q_before_guidance)
                     rel9_before = self._absolute_pose_to_relative9(abs_p_before, abs_r_before, episode_start_pose)
                     cart_before = torch.cat([rel9_before, cart_phys_prev_tgt[..., 9:10]], dim=-1)
                     err_before = torch.linalg.norm(
