@@ -16,6 +16,7 @@ import dill
 import hydra
 import numpy as np
 import torch
+import pytorch_kinematics as pk
 from omegaconf import OmegaConf
 from omegaconf import open_dict
 from diffusion_policy.common.pytorch_util import dict_apply
@@ -23,6 +24,7 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from umi.real_world.real_inference_util import (
     get_real_umi_obs_dict,
 )
+from curobo.util_file import get_robot_configs_path, get_assets_path, join_path, load_yaml
 from scripts_maniskill.utils import (
     make_eval_envs, 
     maniskill_to_umi_env_obs, 
@@ -33,6 +35,31 @@ from scripts_maniskill.utils import (
 from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def _infer_robot_kinematic_args(robot_cfg_name: str):
+    robot_cfg_dict = load_yaml(join_path(get_robot_configs_path(), robot_cfg_name))["robot_cfg"]
+    kin_cfg = robot_cfg_dict.get("kinematics", {})
+    urdf_rel = kin_cfg.get("urdf_path")
+    if urdf_rel is None:
+        return None, kin_cfg.get("ee_link", "eef"), None
+
+    robot_urdf_path = join_path(get_assets_path(), urdf_rel)
+    ee_link_name = kin_cfg.get("ee_link", "eef")
+
+    arm_dof = None
+    try:
+        with open(robot_urdf_path, "r") as f:
+            urdf_str = f.read()
+        try:
+            chain = pk.build_serial_chain_from_urdf(urdf_str, ee_link_name)
+        except ValueError:
+            chain = pk.build_serial_chain_from_urdf(urdf_str.encode("utf-8"), ee_link_name)
+        arm_dof = int(chain.n_joints)
+    except Exception:
+        arm_dof = None
+
+    return robot_urdf_path, ee_link_name, arm_dof
 
 @click.command()
 @click.option('--input', '-i', required=True, help='Path to checkpoint and experiment results')
@@ -54,7 +81,7 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--guidance_scale', default=1.0, type=float, help="Guidance scale for joint-space whole-body collision guidance.")
 @click.option('--guidance_safety_margin', default=0.05, type=float, help="Safety margin (meters) used in collision guidance loss.")
 @click.option('--guidance_activation_distance', default=10.0, type=float, help="Activation distance (meters) for cuRobo SDF query.")
-@click.option('--guidance_grad_clip', default=0.25, type=float, help="Per-step gradient clip for joint-space guidance.")
+@click.option('--guidance_grad_clip', default=1.0, type=float, help="Per-step gradient clip for joint-space guidance.")
 def main(
     input, 
     ckpt_filename, 
@@ -110,9 +137,16 @@ def main(
             'diffusion_policy.policy.diffusion_unet_timm_policy_joint_space_with_guidance.'
             'DiffusionUnetTimmPolicyJointSpaceWithGuidance'
         )
+        robot_cfg_name = robot_cfg_name_map.get(robot_uids, f'{robot_uids}.yml')
+        robot_urdf_path, ee_link_name, arm_dof = _infer_robot_kinematic_args(robot_cfg_name)
         with open_dict(cfg.policy):
             cfg.policy.robot_uid = robot_uids
-            cfg.policy.robot_cfg_name = robot_cfg_name_map.get(robot_uids, f'{robot_uids}.yml')
+            cfg.policy.robot_cfg_name = robot_cfg_name
+            if robot_urdf_path is not None:
+                cfg.policy.robot_urdf_path = robot_urdf_path
+            cfg.policy.ee_link_name = ee_link_name
+            if arm_dof is not None:
+                cfg.policy.arm_dof = arm_dof
             cfg.policy.guidance_scale = guidance_scale
             cfg.policy.guidance_safety_margin = guidance_safety_margin
             cfg.policy.guidance_activation_distance = guidance_activation_distance
@@ -121,8 +155,15 @@ def main(
         cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_with_guidance.DiffusionUnetTimmPolicyWithGuidance"
     elif joint_space:
         cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_joint_space.DiffusionUnetTimmPolicyJointSpace"
+        robot_cfg_name = robot_cfg_name_map.get(robot_uids, f'{robot_uids}.yml')
+        robot_urdf_path, ee_link_name, arm_dof = _infer_robot_kinematic_args(robot_cfg_name)
         with open_dict(cfg.policy):
-            cfg.policy.robot_cfg_name = robot_cfg_name_map.get(robot_uids, f'{robot_uids}.yml')
+            cfg.policy.robot_cfg_name = robot_cfg_name
+            if robot_urdf_path is not None:
+                cfg.policy.robot_urdf_path = robot_urdf_path
+            cfg.policy.ee_link_name = ee_link_name
+            if arm_dof is not None:
+                cfg.policy.arm_dof = arm_dof
     print("model_name:", cfg.policy.obs_encoder.model_name)
     print("dataset_path:", cfg.task.dataset.dataset_path)
 

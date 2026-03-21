@@ -306,7 +306,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             self._coll_query_buffer,
             self._coll_weight,
             self._coll_activation_distance,
-            return_loss=False,
+            return_loss=True,
             compute_esdf=True,
         )
         # Worst-case sphere is the max under cuRobo sign convention.
