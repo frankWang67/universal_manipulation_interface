@@ -30,17 +30,9 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
     """
     Joint-space diffusion with whole-body collision guidance.
 
-    Guidance is applied as a batched CBF-QP in joint space after each reverse DDPM
-    step. For each trajectory state q^o, solve:
-
-        min_{Δq} 1/2 * Δq^T (J_pos^T J_pos + λI) Δq
-        s.t.      ∇h(q^o)^T Δq >= d_safe - h(q^o)
-
-    where:
-      - J_pos is the translational Jacobian block (top-3 rows),
-      - h is a CBF-style safety function mapped from cuRobo ESDF
-        (h >= 0 means safe),
-      - d_safe is guidance_safety_margin.
+    Supported guidance implementations:
+      - "cbf" (default): batched CBF-QP in joint space.
+      - "gd": gradient-descent guidance (same behavior as main branch).
     """
 
     def __init__(
@@ -61,6 +53,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         guidance_steps_per_denoise: int = 1,
         guidance_use_clean_sample: bool = False,
         guidance_cbf_lambda: float = 0.01,
+        guidance_method: str = "cbf",
         **kwargs,
     ):
         if robot_cfg_name is None:
@@ -86,6 +79,17 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         self.guidance_steps_per_denoise = int(max(guidance_steps_per_denoise, 1))
         self.guidance_use_clean_sample = bool(guidance_use_clean_sample)
         self.guidance_cbf_lambda = float(guidance_cbf_lambda)
+        guidance_method = str(guidance_method).lower()
+        if guidance_method in ("gradient_descent", "gd"):
+            guidance_method = "gd"
+        elif guidance_method == "cbf":
+            guidance_method = "cbf"
+        else:
+            raise ValueError(
+                f"Unsupported guidance_method={guidance_method}. "
+                "Use one of: ['cbf', 'gd', 'gradient_descent']"
+            )
+        self.guidance_method = guidance_method
 
         self._world_collision = None
         self._coll_query_buffer = None
@@ -669,52 +673,88 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
 
                 q_before_guidance = q_arm_new.clone()
                 for _ in range(self.guidance_steps_per_denoise):
-                    tg = time.perf_counter()
-                    h_value, grad_h, _dist_signed = self._compute_cbf_linearization(q_guidance_state)
-                    jac_lin = self._jacobian(q_guidance_state).reshape(
-                        bsz, horizon, 6, self._robot_dof
-                    )
-                    jac_pos = jac_lin[..., :3, :]
-                    gamma = self._guidance_scale_at(
-                        idx=idx,
-                        n_steps=n_steps,
-                        t=t,
-                        dtype=q_arm_new.dtype,
-                        device=q_arm_new.device,
-                    )
-                    dq_cbf, _rhs, _denom, _feasible = self._solve_batched_cbf_qp(
-                        jac_pos=jac_pos,
-                        grad_h=grad_h,
-                        h_value=h_value,
-                        constraint_scale=gamma,
-                    )
-                    timing["guidance_grad"] += time.perf_counter() - tg
-
-                    # Do not perturb conditioned prefix steps.
-                    if torch.any(cond_step_mask):
-                        dq_cbf = dq_cbf.clone()
-                        dq_cbf[cond_step_mask] = 0.0
-
-                    ta = time.perf_counter()
-                    if self.guidance_grad_clip > 0:
-                        dq_cbf = torch.clamp(
-                            dq_cbf,
-                            min=-self.guidance_grad_clip,
-                            max=self.guidance_grad_clip,
+                    if self.guidance_method == "cbf":
+                        tg = time.perf_counter()
+                        h_value, grad_h, _dist_signed = self._compute_cbf_linearization(q_guidance_state)
+                        jac_lin = self._jacobian(q_guidance_state).reshape(
+                            bsz, horizon, 6, self._robot_dof
                         )
-
-                    q_arm_new = q_arm_new + dq_cbf
-                    # Keep guidance linearization state synchronized.
-                    q_guidance_state = q_guidance_state + dq_cbf
-                    timing["guidance_apply"] += time.perf_counter() - ta
-
-                    if return_debug:
-                        cbf_violation = torch.relu(self.guidance_safety_margin - h_value)
-                        guide_loss = cbf_violation.sum()
-                        debug["guidance_loss"].append(guide_loss.detach().cpu())
-                        debug["guidance_grad_norm"].append(
-                            torch.linalg.norm(grad_h.reshape(bsz, -1), dim=-1).detach().cpu()
+                        jac_pos = jac_lin[..., :3, :]
+                        gamma = self._guidance_scale_at(
+                            idx=idx,
+                            n_steps=n_steps,
+                            t=t,
+                            dtype=q_arm_new.dtype,
+                            device=q_arm_new.device,
                         )
+                        dq_cbf, _rhs, _denom, _feasible = self._solve_batched_cbf_qp(
+                            jac_pos=jac_pos,
+                            grad_h=grad_h,
+                            h_value=h_value,
+                            constraint_scale=gamma,
+                        )
+                        timing["guidance_grad"] += time.perf_counter() - tg
+
+                        # Do not perturb conditioned prefix steps.
+                        if torch.any(cond_step_mask):
+                            dq_cbf = dq_cbf.clone()
+                            dq_cbf[cond_step_mask] = 0.0
+
+                        ta = time.perf_counter()
+                        if self.guidance_grad_clip > 0:
+                            dq_cbf = torch.clamp(
+                                dq_cbf,
+                                min=-self.guidance_grad_clip,
+                                max=self.guidance_grad_clip,
+                            )
+
+                        q_arm_new = q_arm_new + dq_cbf
+                        # Keep guidance linearization state synchronized.
+                        q_guidance_state = q_guidance_state + dq_cbf
+                        timing["guidance_apply"] += time.perf_counter() - ta
+
+                        if return_debug:
+                            cbf_violation = torch.relu(self.guidance_safety_margin - h_value)
+                            guide_loss = cbf_violation.sum()
+                            debug["guidance_loss"].append(guide_loss.detach().cpu())
+                            debug["guidance_grad_norm"].append(
+                                torch.linalg.norm(grad_h.reshape(bsz, -1), dim=-1).detach().cpu()
+                            )
+                    else:
+                        tg = time.perf_counter()
+                        grad, guide_loss = self._compute_collision_grad(q_guidance_state)
+                        timing["guidance_grad"] += time.perf_counter() - tg
+
+                        # Do not perturb conditioned prefix steps.
+                        if torch.any(cond_step_mask):
+                            grad = grad.clone()
+                            grad[cond_step_mask] = 0.0
+
+                        ta = time.perf_counter()
+                        if self.guidance_grad_clip > 0:
+                            grad = torch.clamp(
+                                grad,
+                                min=-self.guidance_grad_clip,
+                                max=self.guidance_grad_clip,
+                            )
+
+                        gamma = self._guidance_scale_at(
+                            idx=idx,
+                            n_steps=n_steps,
+                            t=t,
+                            dtype=q_arm_new.dtype,
+                            device=q_arm_new.device,
+                        )
+                        q_arm_new = q_arm_new - gamma * grad
+                        # Keep guidance linearization state synchronized.
+                        q_guidance_state = q_guidance_state - gamma * grad
+                        timing["guidance_apply"] += time.perf_counter() - ta
+
+                        if return_debug:
+                            debug["guidance_loss"].append(guide_loss.detach().cpu())
+                            debug["guidance_grad_norm"].append(
+                                torch.linalg.norm(grad.reshape(bsz, -1), dim=-1).detach().cpu()
+                            )
                 timing["guidance_total"] += time.perf_counter() - t0
 
                 if return_debug and self.guidance_use_clean_sample:

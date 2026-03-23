@@ -80,8 +80,9 @@ def _infer_robot_kinematic_args(robot_cfg_name: str):
 @click.option('--joint_space_guidance', is_flag=True, help="Whether to use joint-space policy with whole-body collision guidance.")
 @click.option('--guidance_scale', default=1.0, type=float, help="Guidance scale for joint-space whole-body collision guidance.")
 @click.option('--guidance_safety_margin', default=0.05, type=float, help="Safety margin (meters) used in collision guidance loss.")
-@click.option('--guidance_activation_distance', default=10.0, type=float, help="Activation distance (meters) for cuRobo SDF query.")
+@click.option('--guidance_activation_distance', default=1.0, type=float, help="Activation distance (meters) for cuRobo SDF query.")
 @click.option('--guidance_grad_clip', default=1.0, type=float, help="Per-step gradient clip for joint-space guidance.")
+@click.option('--guidance_method', default='cbf', type=str, help="Guidance method to use, one of ['cbf', 'gd']")
 def main(
     input, 
     ckpt_filename, 
@@ -103,6 +104,7 @@ def main(
     guidance_safety_margin,
     guidance_activation_distance,
     guidance_grad_clip,
+    guidance_method,
 ):
     # load checkpoint
     exp_path = input
@@ -151,6 +153,7 @@ def main(
             cfg.policy.guidance_safety_margin = guidance_safety_margin
             cfg.policy.guidance_activation_distance = guidance_activation_distance
             cfg.policy.guidance_grad_clip = guidance_grad_clip
+            cfg.policy.guidance_method = guidance_method
     elif add_guidance:
         cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_with_guidance.DiffusionUnetTimmPolicyWithGuidance"
     elif joint_space:
