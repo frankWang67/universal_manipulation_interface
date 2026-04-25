@@ -17,6 +17,7 @@ parser.add_argument("--obs-mode", "-o", type=str, default="rgb", help="Observati
 parser.add_argument("--render-mode", "-rm", type=str, default="all", help="Render mode for ManiSkill env")
 parser.add_argument("--steps-per-inference", "-si", type=int, default=8, help="Action horizon for inference")
 parser.add_argument("--max-episode-steps", "-mes", type=int, default=500, help="Max episode steps for evaluation")
+parser.add_argument("--joint-space", action="store_true", help="Whether the policy is a joint space diffusion policy")
 parser.add_argument("--harder", action="store_true", help="Whether to evaluate on harder version of the environment")
 parser.add_argument("--joint-space-guidance", action="store_true", help="Whether to add guidance for the policy during evaluation")
 args = parser.parse_args()
@@ -77,6 +78,8 @@ def main():
         cmd += f" --render_mode {args.render_mode}"
         cmd += f" --steps_per_inference {args.steps_per_inference}"
         cmd += f" --max_episode_steps {args.max_episode_steps}"
+        if args.joint_space:
+            cmd += " --joint_space"
         if args.harder:
             cmd += " --harder"
         if args.joint_space_guidance:

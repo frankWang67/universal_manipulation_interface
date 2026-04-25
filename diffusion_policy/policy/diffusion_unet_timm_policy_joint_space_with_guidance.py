@@ -54,6 +54,9 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         guidance_use_clean_sample: bool = False,
         guidance_cbf_lambda: float = 0.01,
         guidance_method: str = "cbf",
+        guidance_sdf_agg: str = "topk",
+        guidance_sdf_softmax_temp: float = 20.0,
+        guidance_sdf_topk: int = 4,
         **kwargs,
     ):
         if robot_cfg_name is None:
@@ -79,6 +82,19 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         self.guidance_steps_per_denoise = int(max(guidance_steps_per_denoise, 1))
         self.guidance_use_clean_sample = bool(guidance_use_clean_sample)
         self.guidance_cbf_lambda = float(guidance_cbf_lambda)
+        guidance_sdf_agg = str(guidance_sdf_agg).lower()
+        # Keep "softmax" as a backward-compatible alias for the old branch,
+        # but implement it with a top-k normalized smooth max to avoid the
+        # large positive bias of unnormalized logsumexp over all spheres.
+        if guidance_sdf_agg == "softmax":
+            guidance_sdf_agg = "topk"
+        if guidance_sdf_agg not in ("max", "topk"):
+            raise ValueError(
+                f"Unsupported guidance_sdf_agg={guidance_sdf_agg}. Use one of: ['max', 'topk']"
+            )
+        self.guidance_sdf_agg = guidance_sdf_agg
+        self.guidance_sdf_softmax_temp = float(guidance_sdf_softmax_temp)
+        self.guidance_sdf_topk = int(max(guidance_sdf_topk, 1))
         guidance_method = str(guidance_method).lower()
         if guidance_method in ("gradient_descent", "gd"):
             guidance_method = "gd"
@@ -96,6 +112,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         self._coll_weight = None
         self._coll_activation_distance = None
         self._cached_world_key = None
+        self._coll_env_query_idx = None
 
     @staticmethod
     def _infer_robot_cfg_name(robot_uid: Optional[str]) -> str:
@@ -180,14 +197,16 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             self._world_collision = None
             self._coll_query_buffer = None
             self._cached_world_key = None
+            self._coll_env_query_idx = None
             return
 
-        # Build world by including obstacles from all parallel environments.
-        # This avoids guidance mismatch when vectorized eval randomizes obstacle
-        # poses per environment.
-        world_cuboids = []
+        # Build one cuRobo world per parallel environment. A previous version
+        # merged all env obstacles into a single world, which made each batch
+        # sample avoid obstacles from other randomized envs.
+        n_env = 1
+        normalized_obstacles = []
         world_key_items = []
-        for i, obs in enumerate(obstacles):
+        for obs in obstacles:
             center = obs["center"]
             quat = obs["quat"]
             extent = obs["extent"]
@@ -203,14 +222,19 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             quat = quat.to(device=device, dtype=dtype)
             extent = extent.to(device=device, dtype=dtype)
 
-            n_env_obs = int(center.shape[0])
-            for j in range(n_env_obs):
-                c = center[j]
+            n_env = max(n_env, int(center.shape[0]), int(quat.shape[0]), int(extent.shape[0]))
+            normalized_obstacles.append((center, quat, extent))
+
+        world_cuboids_by_env = [[] for _ in range(n_env)]
+        world_key_items = []
+        for i, (center, quat, extent) in enumerate(normalized_obstacles):
+            for j in range(n_env):
+                c = center[j if center.shape[0] > 1 else 0]
                 q = quat[j if quat.shape[0] > 1 else 0]
                 e = extent[j if extent.shape[0] > 1 else 0]
                 world_key_items.append(torch.cat([c, q, e], dim=0))
 
-                world_cuboids.append(
+                world_cuboids_by_env[j].append(
                     Cuboid(
                         name=f"obs_{i}_{j}",
                         pose=[
@@ -236,9 +260,12 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             and self._cached_world_key.shape == world_key.shape
             and torch.allclose(self._cached_world_key, world_key, atol=1e-6, rtol=0.0)
         ):
+            self._coll_env_query_idx = torch.arange(
+                n_env, device=device, dtype=torch.int32
+            )
             return
 
-        world_config = WorldConfig(cuboid=world_cuboids)
+        world_config = [WorldConfig(cuboid=cuboids) for cuboids in world_cuboids_by_env]
         world_coll_config = WorldCollisionConfig(
             tensor_args=self._tensor_args,
             world_model=world_config,
@@ -250,6 +277,19 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             torch.tensor([self.guidance_activation_distance], dtype=dtype)
         )
         self._cached_world_key = world_key.detach().clone()
+        self._coll_env_query_idx = torch.arange(n_env, device=device, dtype=torch.int32)
+
+    def _env_query_idx_for_batch(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+        if self._coll_env_query_idx is None:
+            return None
+        if int(self._coll_env_query_idx.numel()) == batch_size:
+            return self._coll_env_query_idx.to(device=device)
+        if int(self._coll_env_query_idx.numel()) == 1:
+            return torch.zeros(batch_size, device=device, dtype=torch.int32)
+        raise ValueError(
+            f"Collision world has {self._coll_env_query_idx.numel()} envs, "
+            f"but query batch has size {batch_size}."
+        )
 
     def _collision_penalty(self, dist: torch.Tensor) -> torch.Tensor:
         penetration = dist + self.guidance_safety_margin
@@ -292,7 +332,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
 
     def _query_worst_signed_distance(self, q_arm: torch.Tensor) -> torch.Tensor:
         """
-        Returns worst-case cuRobo signed distance over robot collision spheres.
+        Returns aggregated cuRobo signed distance over robot collision spheres.
         Output shape: (B, T)
         """
         B, T, D = q_arm.shape
@@ -310,11 +350,40 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             self._coll_query_buffer,
             self._coll_weight,
             self._coll_activation_distance,
+            env_query_idx=self._env_query_idx_for_batch(B, spheres.device),
             return_loss=True,
             compute_esdf=True,
         )
-        # Worst-case sphere is the max under cuRobo sign convention.
-        return dist.max(dim=-1).values
+        return self._aggregate_signed_distance(dist)
+
+    def _aggregate_signed_distance(self, dist: torch.Tensor) -> torch.Tensor:
+        """
+        Aggregate per-sphere signed distances into one value per (B, T).
+
+        cuRobo sign convention here is positive inside obstacle, negative outside.
+        """
+        if self.guidance_sdf_agg == "max":
+            return dist.max(dim=-1).values
+
+        k = min(self.guidance_sdf_topk, int(dist.shape[-1]))
+        topk = torch.topk(dist, k=k, dim=-1).values
+        max_val = topk[..., 0]
+        if k == 1:
+            return max_val
+
+        temp = torch.tensor(
+            max(self.guidance_sdf_softmax_temp, 1e-6),
+            device=dist.device,
+            dtype=dist.dtype,
+        )
+        shifted = topk - max_val.unsqueeze(-1)
+        # Normalized smooth max over only the top-k spheres. This stays <= max,
+        # so it does not create the large positive bias of raw logsumexp.
+        smooth_topk = max_val + torch.log(torch.exp(shifted * temp).mean(dim=-1)) / temp
+        # If any of the top-k spheres is already penetrating the obstacle
+        # (max_val > 0), preserve that positive sign exactly instead of
+        # averaging it away with nearby negative spheres.
+        return torch.where(max_val > 0, max_val, smooth_topk)
 
     def _compute_cbf_linearization(
         self, q_arm: torch.Tensor
@@ -421,6 +490,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                 self._coll_query_buffer,
                 self._coll_weight,
                 self._coll_activation_distance,
+                env_query_idx=self._env_query_idx_for_batch(B, spheres.device),
                 return_loss=False,
                 compute_esdf=True,
             )
@@ -428,8 +498,8 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             # cuRobo ESDF sign convention here is positive inside obstacle,
             # negative outside; therefore "closest" in physical sense is the
             # maximum signed distance value.
-            dist_worst = dist.max(dim=-1).values
-            penalty = self._collision_penalty(dist_worst)
+            dist_agg = self._aggregate_signed_distance(dist)
+            penalty = self._collision_penalty(dist_agg)
 
             # Batch dimension is only for parallelism; do not average across B.
             # Summation preserves independent per-sample gradients without
@@ -865,10 +935,21 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         else:
             assert nsample.shape == (B, self.action_horizon, self.action_dim)
         action_pred = self.normalizer["action"].unnormalize(nsample)
+        joint_action_pred = None
+        if self._last_joint_traj is not None:
+            joint_action_pred = self._joint_traj_to_env_action(self._last_joint_traj)
         if env_batched:
             action_pred = action_pred.reshape(B, env_batch_size, self.action_horizon, self.action_dim)
+            if joint_action_pred is not None:
+                joint_action_pred = joint_action_pred.reshape(
+                    B, env_batch_size, self.action_horizon, self.arm_dof + 1
+                )
 
-        return {
+        result = {
             "action": action_pred,
             "action_pred": action_pred,
         }
+        if joint_action_pred is not None:
+            result["joint_action"] = joint_action_pred
+            result["joint_action_pred"] = joint_action_pred
+        return result

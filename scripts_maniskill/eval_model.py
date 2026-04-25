@@ -29,6 +29,7 @@ from scripts_maniskill.utils import (
     make_eval_envs, 
     maniskill_to_umi_env_obs, 
     get_maniskill_umi_action, 
+    get_maniskill_joint_action,
     evaluate,
 )
 
@@ -79,10 +80,13 @@ def _infer_robot_kinematic_args(robot_cfg_name: str):
 @click.option('--joint_space', is_flag=True, help="Whether the policy is a joint space diffusion policy.")
 @click.option('--joint_space_guidance', is_flag=True, help="Whether to use joint-space policy with whole-body collision guidance.")
 @click.option('--guidance_scale', default=1.0, type=float, help="Guidance scale for joint-space whole-body collision guidance.")
-@click.option('--guidance_safety_margin', default=0.05, type=float, help="Safety margin (meters) used in collision guidance loss.")
+@click.option('--guidance_safety_margin', default=0.07, type=float, help="Safety margin (meters) used in collision guidance loss.")
 @click.option('--guidance_activation_distance', default=1.0, type=float, help="Activation distance (meters) for cuRobo SDF query.")
-@click.option('--guidance_grad_clip', default=1.0, type=float, help="Per-step gradient clip for joint-space guidance.")
+@click.option('--guidance_grad_clip', default=0.01, type=float, help="Per-step gradient clip for joint-space guidance.")
 @click.option('--guidance_method', default='cbf', type=str, help="Guidance method to use, one of ['cbf', 'gd']")
+@click.option('--guidance_sdf_agg', default='topk', type=str, help="SDF aggregation over robot spheres: one of ['max', 'topk'] (legacy 'softmax' is treated as 'topk').")
+@click.option('--guidance_sdf_softmax_temp', default=20.0, type=float, help="Temperature for top-k normalized smooth-max aggregation.")
+@click.option('--guidance_sdf_topk', default=4, type=int, help="Number of top spheres used by top-k SDF aggregation.")
 def main(
     input, 
     ckpt_filename, 
@@ -105,6 +109,9 @@ def main(
     guidance_activation_distance,
     guidance_grad_clip,
     guidance_method,
+    guidance_sdf_agg,
+    guidance_sdf_softmax_temp,
+    guidance_sdf_topk,
 ):
     # load checkpoint
     exp_path = input
@@ -139,6 +146,10 @@ def main(
             'diffusion_policy.policy.diffusion_unet_timm_policy_joint_space_with_guidance.'
             'DiffusionUnetTimmPolicyJointSpaceWithGuidance'
         )
+        # cfg.policy._target_ = (
+        #     'diffusion_policy.policy.diffusion_unet_timm_policy_joint_space_clean_sample_with_guidance.'
+        #     'DiffusionUnetTimmPolicyJointSpaceCleanSampleWithGuidance'
+        # )
         robot_cfg_name = robot_cfg_name_map.get(robot_uids, f'{robot_uids}.yml')
         robot_urdf_path, ee_link_name, arm_dof = _infer_robot_kinematic_args(robot_cfg_name)
         with open_dict(cfg.policy):
@@ -154,10 +165,14 @@ def main(
             cfg.policy.guidance_activation_distance = guidance_activation_distance
             cfg.policy.guidance_grad_clip = guidance_grad_clip
             cfg.policy.guidance_method = guidance_method
+            cfg.policy.guidance_sdf_agg = guidance_sdf_agg
+            cfg.policy.guidance_sdf_softmax_temp = guidance_sdf_softmax_temp
+            cfg.policy.guidance_sdf_topk = guidance_sdf_topk
     elif add_guidance:
         cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_with_guidance.DiffusionUnetTimmPolicyWithGuidance"
     elif joint_space:
         cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_joint_space.DiffusionUnetTimmPolicyJointSpace"
+        # cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_joint_space_clean_sample.DiffusionUnetTimmPolicyJointSpaceCleanSample"
         robot_cfg_name = robot_cfg_name_map.get(robot_uids, f'{robot_uids}.yml')
         robot_urdf_path, ee_link_name, arm_dof = _infer_robot_kinematic_args(robot_cfg_name)
         with open_dict(cfg.policy):
@@ -242,10 +257,17 @@ def main(
         else:
             episode_start_pose_tensor = None
         result = policy.predict_action(obs_dict, env_batched=False, episode_start_pose=episode_start_pose_tensor)
-        action = result['action_pred'].detach().to('cpu').numpy()
-        assert action.shape[-1] == 10
-        action = get_maniskill_umi_action(action, obs, action_pose_repr, batched=True)
-        assert action.shape[-1] == 8
+        if control_mode.startswith("pd_joint"):
+            action = result["joint_action_pred"].detach().to("cpu").numpy()
+            single_action_space = getattr(env, "single_action_space", env.action_space)
+            action = get_maniskill_joint_action(action, action_space=single_action_space)
+            assert action.shape[-1] == single_action_space.shape[-1]
+        else:
+            action = result['action_pred'].detach().to('cpu').numpy()
+            assert action.shape[-1] == 10
+            action = get_maniskill_umi_action(action, obs, action_pose_repr, batched=True)
+            single_action_space = getattr(env, "single_action_space", env.action_space)
+            assert action.shape[-1] == single_action_space.shape[-1]
         del result
 
     print('Ready! Start evaluation.')
@@ -254,6 +276,7 @@ def main(
         (add_guidance or joint_space_guidance),
         (joint_space or joint_space_guidance),
         device,
+        control_mode=control_mode,
     )
     print("Evaluation results over {} episodes:".format(num_eval_episodes))
     success_once_rate = np.mean(eval_metrics["success_once"])

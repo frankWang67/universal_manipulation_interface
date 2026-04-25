@@ -234,7 +234,39 @@ def get_maniskill_umi_action(
     env_action = np.concatenate(env_action, axis=-1)
     return env_action
 
-def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, joint_space, device, progress_bar: bool = True):
+
+def get_maniskill_joint_action(
+        joint_action: np.ndarray,
+        action_space=None,
+    ):
+    """
+    Convert policy joint-space prediction to ManiSkill joint-position action.
+
+    joint_action already follows the ManiSkill joint controller layout:
+    [arm_joint_positions..., gripper_width].
+    """
+    env_action = np.asarray(joint_action, dtype=np.float32)
+    if action_space is not None:
+        low = np.asarray(action_space.low, dtype=np.float32)
+        high = np.asarray(action_space.high, dtype=np.float32)
+        while low.ndim > 1 and low.shape[0] == 1:
+            low = low[0]
+            high = high[0]
+        env_action = np.clip(env_action, low, high)
+    return env_action
+
+def evaluate(
+    n: int,
+    cfg,
+    policy,
+    eval_envs,
+    steps_per_inference,
+    add_guidance,
+    joint_space,
+    device,
+    control_mode: str = "pd_ee_pose",
+    progress_bar: bool = True,
+):
     assert steps_per_inference >= 1 and steps_per_inference <= cfg.task.action_horizon, \
         f"steps_per_inference should be in [1, {cfg.task.action_horizon}], but got {steps_per_inference}"
     obs_pose_rep = cfg.task.pose_repr.obs_pose_repr
@@ -293,8 +325,21 @@ def evaluate(n: int, cfg, policy, eval_envs, steps_per_inference, add_guidance, 
             inference_call_count += 1
             inference_time_total += dt
             # ======== END ADDED: MEASURE MODEL INFERENCE ========
-            raw_action = result['action_pred'].detach().to('cpu').numpy()
-            action_seq = get_maniskill_umi_action(raw_action, obs, action_pose_repr, batched=True)
+            use_joint_control = control_mode.startswith("pd_joint")
+            if use_joint_control:
+                if "joint_action_pred" not in result:
+                    raise KeyError(
+                        "Policy did not return joint_action_pred, but joint-space "
+                        f"control_mode={control_mode} was requested."
+                    )
+                raw_joint_action = result["joint_action_pred"].detach().to("cpu").numpy()
+                action_seq = get_maniskill_joint_action(
+                    raw_joint_action,
+                    action_space=getattr(eval_envs, "single_action_space", eval_envs.action_space),
+                )
+            else:
+                raw_action = result['action_pred'].detach().to('cpu').numpy()
+                action_seq = get_maniskill_umi_action(raw_action, obs, action_pose_repr, batched=True)
 
             for i in range(steps_per_inference):
                 obs, rew, terminated, truncated, info = eval_envs.step(action_seq[:, i])

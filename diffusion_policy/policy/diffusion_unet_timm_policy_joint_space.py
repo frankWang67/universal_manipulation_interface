@@ -90,6 +90,17 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         self._robot_dof = None
         self._last_joint_traj = None
 
+    def _joint_traj_to_env_action(self, q_traj: torch.Tensor) -> torch.Tensor:
+        """
+        Convert internal joint trajectory to ManiSkill joint-position actions.
+
+        Internal q_traj layout is [full_robot_q_from_curobo, gripper_width], while
+        ManiSkill joint-space control expects [arm_joint_pos, gripper_width].
+        """
+        arm_q = q_traj[..., : self.arm_dof]
+        grip = q_traj[..., self._robot_dof : self._robot_dof + 1]
+        return torch.cat([arm_q, grip], dim=-1)
+
     # ===========================
     # Kinematics initialization
     # ===========================
@@ -118,7 +129,12 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
 
         with open(self.robot_urdf_path, "r") as f:
             urdf_str = f.read()
-        self._pk_chain = pk.build_serial_chain_from_urdf(urdf_str, self.ee_link_name)
+        try:
+            self._pk_chain = pk.build_serial_chain_from_urdf(urdf_str, self.ee_link_name)
+        except ValueError:
+            self._pk_chain = pk.build_serial_chain_from_urdf(
+                urdf_str.encode("utf-8"), self.ee_link_name
+            )
         self._pk_chain = self._pk_chain.to(dtype=torch.float32, device=device)
 
     @staticmethod
@@ -598,10 +614,21 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         else:
             assert nsample.shape == (B, self.action_horizon, self.action_dim)
         action_pred = self.normalizer["action"].unnormalize(nsample)
+        joint_action_pred = None
+        if self._last_joint_traj is not None:
+            joint_action_pred = self._joint_traj_to_env_action(self._last_joint_traj)
         if env_batched:
             action_pred = action_pred.reshape(B, env_batch_size, self.action_horizon, self.action_dim)
+            if joint_action_pred is not None:
+                joint_action_pred = joint_action_pred.reshape(
+                    B, env_batch_size, self.action_horizon, self.arm_dof + 1
+                )
 
-        return {
+        result = {
             "action": action_pred,
             "action_pred": action_pred,
         }
+        if joint_action_pred is not None:
+            result["joint_action"] = joint_action_pred
+            result["joint_action_pred"] = joint_action_pred
+        return result
