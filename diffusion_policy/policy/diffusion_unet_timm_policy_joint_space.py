@@ -53,7 +53,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         ee_link_name: str = "eef",
         arm_dof: int = 7,
         ik_num_seeds: int = 20,
-        jacobian_damping: float = 0.01,
+        jacobian_damping: float = 0.001,
         ik_refine_each_step: bool = False,
         ik_position_threshold: float = 5e-4,
         ik_rotation_threshold: float = 5e-3,
@@ -62,6 +62,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         ik_refine_last_step: bool = False,
         noise_init_mode: str = "jacobian_projected",
         jac_noise_alpha: float = 0.1,
+        cartesian_delta_mode: str = "geometric",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -80,9 +81,12 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         self.ik_refine_last_step = bool(ik_refine_last_step)
         self.noise_init_mode = str(noise_init_mode)
         self.jac_noise_alpha = float(jac_noise_alpha)
+        self.cartesian_delta_mode = str(cartesian_delta_mode)
 
         assert self.noise_init_mode in ("isotropic", "jacobian_projected", "jacobian_diagonal"), \
             f"Unknown noise_init_mode: {self.noise_init_mode}"
+        assert self.cartesian_delta_mode in ("geometric", "se3_delta"), \
+            f"Unknown cartesian_delta_mode: {self.cartesian_delta_mode}"
 
         self._ik_solver = None
         self._kin_model = None
@@ -246,6 +250,11 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         else:
             quat_flat = kin_state.ee_pose.quaternion
 
+        # cuRobo reuses internal buffers across get_state() calls. Return
+        # independent tensors so callers can safely keep FK results while
+        # evaluating another state.
+        pos_flat = pos_flat.clone()
+        quat_flat = quat_flat.clone()
         rot_flat = quaternion_to_matrix(quat_flat)
         pos = pos_flat.reshape(B, T, 3)
         rot = rot_flat.reshape(B, T, 3, 3)
@@ -293,12 +302,25 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         cur_flat = abs_pose9_curr.reshape(-1, 9)
         tgt_flat = abs_pose9_tgt.reshape(-1, 9)
 
-        t_cur = pose9d_to_mat(cur_flat)
-        t_tgt = pose9d_to_mat(tgt_flat)
-        t_delta = t_tgt @ self._inv_se3(t_cur)
+        mode = getattr(self, "cartesian_delta_mode", "geometric")
+        if mode == "se3_delta":
+            # Legacy mode kept for controlled ablations. This is not a
+            # geometric-Jacobian residual because the translation part equals
+            # p_tgt - R_delta p_cur, which includes a rotation-around-origin
+            # term when the target only changes orientation.
+            t_cur = pose9d_to_mat(cur_flat)
+            t_tgt = pose9d_to_mat(tgt_flat)
+            t_delta = t_tgt @ self._inv_se3(t_cur)
+            dpos = t_delta[:, :3, 3]
+            drot = matrix_to_axis_angle(t_delta[:, :3, :3])
+        else:
+            pos_cur = cur_flat[:, :3]
+            rot_cur = rot6d_to_matrix(cur_flat[:, 3:])
+            pos_tgt = tgt_flat[:, :3]
+            rot_tgt = rot6d_to_matrix(tgt_flat[:, 3:])
 
-        dpos = t_delta[:, :3, 3]
-        drot = matrix_to_axis_angle(t_delta[:, :3, :3])
+            dpos = pos_tgt - pos_cur
+            drot = matrix_to_axis_angle(rot_tgt @ rot_cur.transpose(-2, -1))
         return torch.cat([dpos, drot], dim=-1).reshape(b, t, 6)
 
     # ===========================

@@ -57,6 +57,8 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         guidance_sdf_agg: str = "topk",
         guidance_sdf_softmax_temp: float = 20.0,
         guidance_sdf_topk: int = 4,
+        guidance_task_pos_weight: float = 1.0,
+        guidance_task_rot_weight: float = 1.0,
         **kwargs,
     ):
         if robot_cfg_name is None:
@@ -95,6 +97,8 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         self.guidance_sdf_agg = guidance_sdf_agg
         self.guidance_sdf_softmax_temp = float(guidance_sdf_softmax_temp)
         self.guidance_sdf_topk = int(max(guidance_sdf_topk, 1))
+        self.guidance_task_pos_weight = float(guidance_task_pos_weight)
+        self.guidance_task_rot_weight = float(guidance_task_rot_weight)
         guidance_method = str(guidance_method).lower()
         if guidance_method in ("gradient_descent", "gd"):
             guidance_method = "gd"
@@ -417,10 +421,15 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         Solve batched single-inequality QP in closed form.
 
         QP:
-          min 1/2 * dq^T H dq, with H = J_pos^T J_pos + λI
+          min 1/2 * dq^T H dq, with H = J_task^T W J_task + λI
           s.t. grad_h^T dq >= d_safe - h
+
+        jac_pos is kept as the argument name for compatibility. It may be a
+        3D position Jacobian or a full 6D geometric Jacobian. With a 6D input,
+        the rotational rows are weighted by guidance_task_rot_weight so CBF
+        cannot satisfy avoidance mainly by rotating the TCP/contact frame.
         """
-        B, T, _, D = jac_pos.shape
+        B, T, task_dim, D = jac_pos.shape
         N = B * T
 
         # Solve CBF-QP only in controllable arm subspace.
@@ -431,7 +440,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         # effective arm correction.
         ctrl_dof = int(min(max(self.arm_dof, 1), D))
 
-        J = jac_pos[..., :ctrl_dof].reshape(N, 3, ctrl_dof)
+        J = jac_pos[..., :ctrl_dof].reshape(N, task_dim, ctrl_dof)
         a = grad_h[..., :ctrl_dof].reshape(N, ctrl_dof)
         h_flat = h_value.reshape(N)
 
@@ -443,7 +452,15 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         rhs = torch.clamp(rhs, min=0.0)
 
         eye = torch.eye(ctrl_dof, device=J.device, dtype=J.dtype).unsqueeze(0)
-        H = J.transpose(-2, -1) @ J + self.guidance_cbf_lambda * eye
+        if task_dim >= 6 and self.guidance_task_rot_weight > 0.0:
+            weights = torch.ones((task_dim,), device=J.device, dtype=J.dtype)
+            weights[:3] = self.guidance_task_pos_weight
+            weights[3:6] = self.guidance_task_rot_weight
+        else:
+            weights = torch.ones((task_dim,), device=J.device, dtype=J.dtype)
+            weights[: min(3, task_dim)] = self.guidance_task_pos_weight
+        H = (J * weights.view(1, task_dim, 1)).transpose(-2, -1) @ J
+        H = H + self.guidance_cbf_lambda * eye
 
         a_col = a.unsqueeze(-1)
         H_inv_a = torch.linalg.solve(H, a_col).squeeze(-1)
@@ -749,7 +766,6 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                         jac_lin = self._jacobian(q_guidance_state).reshape(
                             bsz, horizon, 6, self._robot_dof
                         )
-                        jac_pos = jac_lin[..., :3, :]
                         gamma = self._guidance_scale_at(
                             idx=idx,
                             n_steps=n_steps,
@@ -758,7 +774,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                             device=q_arm_new.device,
                         )
                         dq_cbf, _rhs, _denom, _feasible = self._solve_batched_cbf_qp(
-                            jac_pos=jac_pos,
+                            jac_pos=jac_lin,
                             grad_h=grad_h,
                             h_value=h_value,
                             constraint_scale=gamma,

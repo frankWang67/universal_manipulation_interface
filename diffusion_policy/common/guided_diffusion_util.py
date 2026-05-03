@@ -182,7 +182,9 @@ def get_pred_x0(noise_pred, noisy_action_seq, alpha_prod_k):
     return (noisy_action_seq - torch.sqrt(1 - alpha_prod_k) * noise_pred) / torch.sqrt(alpha_prod_k)
 
 def flatten_obstacle_info(obstacles):
-    if isinstance(obstacles, list):
+    if isinstance(obstacles, list) and (
+        len(obstacles) == 0 or isinstance(obstacles[0], dict)
+    ):
         return obstacles
 
     res = []

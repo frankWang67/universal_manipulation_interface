@@ -73,7 +73,7 @@ def _infer_robot_kinematic_args(robot_cfg_name: str):
 @click.option('--num_eval_episodes', '-ne', default=100, type=int, help='Number of evaluation episodes')
 @click.option('--obs_mode', '-o', default='rgb', help='Observation mode for ManiSkill env')
 @click.option('--render_mode', '-rm', default='all', help='Render mode for ManiSkill env')
-@click.option('--steps_per_inference', '-si', default=8, type=int, help="Action horizon for inference.")
+@click.option('--steps_per_inference', '-si', default=0, type=int, help="Number of predicted actions to execute per policy call. Use 0 to execute cfg.task.action_horizon.")
 @click.option('--max_episode_steps', '-mes', default=500, type=int, help="Max episode steps for evaluation.")
 @click.option('--harder', is_flag=True, help="Whether to use harder environment setting with more obstacles and narrower workspace.")
 @click.option('--add_guidance', is_flag=True, help="Whether to add obstacle avoidance guidance during inference.")
@@ -87,6 +87,12 @@ def _infer_robot_kinematic_args(robot_cfg_name: str):
 @click.option('--guidance_sdf_agg', default='topk', type=str, help="SDF aggregation over robot spheres: one of ['max', 'topk'] (legacy 'softmax' is treated as 'topk').")
 @click.option('--guidance_sdf_softmax_temp', default=20.0, type=float, help="Temperature for top-k normalized smooth-max aggregation.")
 @click.option('--guidance_sdf_topk', default=4, type=int, help="Number of top spheres used by top-k SDF aggregation.")
+@click.option('--guidance_task_pos_weight', default=1.0, type=float, help="Position weight in the joint-space CBF task metric.")
+@click.option('--guidance_task_rot_weight', default=0.1, type=float, help="Rotation weight in the joint-space CBF task metric.")
+@click.option('--guidance_use_clean_sample', is_flag=True, help="Apply joint-space guidance on an estimated clean x0 joint sample.")
+@click.option('--guidance_apply_last_step_only', is_flag=True, help="Apply joint-space guidance only at the final denoising step.")
+@click.option('--ik_refine_last_step', is_flag=True, help="Run a cuRobo IK projection at the last denoising step for joint-space policies.")
+@click.option('--cartesian_delta_mode', default='geometric', type=click.Choice(['geometric', 'se3_delta']), help="Pose residual used by joint-space policies.")
 def main(
     input, 
     ckpt_filename, 
@@ -112,6 +118,12 @@ def main(
     guidance_sdf_agg,
     guidance_sdf_softmax_temp,
     guidance_sdf_topk,
+    guidance_task_pos_weight,
+    guidance_task_rot_weight,
+    guidance_use_clean_sample,
+    guidance_apply_last_step_only,
+    ik_refine_last_step,
+    cartesian_delta_mode,
 ):
     # load checkpoint
     exp_path = input
@@ -132,6 +144,8 @@ def main(
     assert os.path.exists(ckpt_path), f"Checkpoint {ckpt_path} does not exist."
     payload = torch.load(open(ckpt_path, 'rb'), map_location='cpu', pickle_module=dill)
     cfg = payload['cfg']
+    if steps_per_inference <= 0:
+        steps_per_inference = int(cfg.task.action_horizon)
 
     robot_cfg_name_map = {
         'panda_robotiq_wristcam': 'panda_robotiq_wristcam.yml',
@@ -168,6 +182,12 @@ def main(
             cfg.policy.guidance_sdf_agg = guidance_sdf_agg
             cfg.policy.guidance_sdf_softmax_temp = guidance_sdf_softmax_temp
             cfg.policy.guidance_sdf_topk = guidance_sdf_topk
+            cfg.policy.guidance_task_pos_weight = guidance_task_pos_weight
+            cfg.policy.guidance_task_rot_weight = guidance_task_rot_weight
+            cfg.policy.guidance_use_clean_sample = guidance_use_clean_sample
+            cfg.policy.guidance_apply_last_step_only = guidance_apply_last_step_only
+            cfg.policy.ik_refine_last_step = ik_refine_last_step
+            cfg.policy.cartesian_delta_mode = cartesian_delta_mode
     elif add_guidance:
         cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_timm_policy_with_guidance.DiffusionUnetTimmPolicyWithGuidance"
     elif joint_space:
@@ -182,6 +202,8 @@ def main(
             cfg.policy.ee_link_name = ee_link_name
             if arm_dof is not None:
                 cfg.policy.arm_dof = arm_dof
+            cfg.policy.ik_refine_last_step = ik_refine_last_step
+            cfg.policy.cartesian_delta_mode = cartesian_delta_mode
     print("model_name:", cfg.policy.obs_encoder.model_name)
     print("dataset_path:", cfg.task.dataset.dataset_path)
 
@@ -200,6 +222,7 @@ def main(
         obs_mode=obs_mode,
         render_mode=render_mode,
         max_episode_steps=max_episode_steps,
+        sensor_configs=dict(shader_pack="default"),
     )
     if harder or add_guidance or joint_space_guidance:
         env_kwargs['harder'] = True

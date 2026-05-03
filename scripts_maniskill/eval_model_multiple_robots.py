@@ -15,11 +15,23 @@ parser.add_argument("--num-env", "-n", type=int, default=10, help="Number of par
 parser.add_argument("--num-eval-episodes", "-ne", type=int, default=100, help="Number of evaluation episodes")
 parser.add_argument("--obs-mode", "-o", type=str, default="rgb", help="Observation mode for ManiSkill env")
 parser.add_argument("--render-mode", "-rm", type=str, default="all", help="Render mode for ManiSkill env")
-parser.add_argument("--steps-per-inference", "-si", type=int, default=8, help="Action horizon for inference")
+parser.add_argument(
+    "--steps-per-inference",
+    "-si",
+    type=int,
+    default=0,
+    help="Number of predicted actions to execute per policy call. Use 0 to execute the checkpoint action horizon.",
+)
 parser.add_argument("--max-episode-steps", "-mes", type=int, default=500, help="Max episode steps for evaluation")
 parser.add_argument("--joint-space", action="store_true", help="Whether the policy is a joint space diffusion policy")
 parser.add_argument("--harder", action="store_true", help="Whether to evaluate on harder version of the environment")
 parser.add_argument("--joint-space-guidance", action="store_true", help="Whether to add guidance for the policy during evaluation")
+parser.add_argument("--guidance-scale", type=float, default=1.0, help="Guidance scale for joint-space guidance")
+parser.add_argument("--guidance-safety-margin", type=float, default=0.07, help="Safety margin for joint-space guidance")
+parser.add_argument("--guidance-grad-clip", type=float, default=0.01, help="Per-step joint-space guidance clip")
+parser.add_argument("--guidance-task-rot-weight", type=float, default=1.0, help="Rotation weight in the joint-space CBF task metric")
+parser.add_argument("--guidance-use-clean-sample", action="store_true", help="Apply guidance on an estimated clean x0 joint sample")
+parser.add_argument("--guidance-apply-last-step-only", action="store_true", help="Apply guidance only at the final denoising step")
 args = parser.parse_args()
 
 # ================= 配置区域 =================
@@ -84,6 +96,14 @@ def main():
             cmd += " --harder"
         if args.joint_space_guidance:
             cmd += " --joint_space_guidance"
+            cmd += f" --guidance_scale {args.guidance_scale}"
+            cmd += f" --guidance_safety_margin {args.guidance_safety_margin}"
+            cmd += f" --guidance_grad_clip {args.guidance_grad_clip}"
+            cmd += f" --guidance_task_rot_weight {args.guidance_task_rot_weight}"
+            if args.guidance_use_clean_sample:
+                cmd += " --guidance_use_clean_sample"
+            if args.guidance_apply_last_step_only:
+                cmd += " --guidance_apply_last_step_only"
         run_command(cmd)
 
 if __name__ == "__main__":
