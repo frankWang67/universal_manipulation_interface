@@ -289,6 +289,26 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         dq = (j_t @ y).squeeze(-1)  # (N,D)
         return dq
 
+    def _twist6_from_matrices(
+        self,
+        abs_pos_curr: torch.Tensor,
+        abs_rot_curr: torch.Tensor,
+        abs_pos_tgt: torch.Tensor,
+        abs_rot_tgt: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute world-frame 6D twist directly from rotation matrices,
+        avoiding an unnecessary matrix→rot6d→matrix round-trip.
+        """
+        bsz, horizon = abs_pos_curr.shape[:2]
+        pos_cur = abs_pos_curr.reshape(-1, 3)
+        rot_cur = abs_rot_curr.reshape(-1, 3, 3)
+        pos_tgt = abs_pos_tgt.reshape(-1, 3)
+        rot_tgt = abs_rot_tgt.reshape(-1, 3, 3)
+        dpos = pos_tgt - pos_cur
+        drot = matrix_to_axis_angle(rot_tgt @ rot_cur.transpose(-2, -1))
+        return torch.cat([dpos, drot], dim=-1).reshape(bsz, horizon, 6)
+
     def _absolute_pose_delta_to_twist6(
         self,
         abs_pose9_curr: torch.Tensor,
@@ -343,6 +363,13 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
             raise ValueError("episode_start_pose is required for joint-space inference.")
 
         self._ensure_kinematics(condition_data.device)
+
+        # Pre-compute base coordinate frame from episode_start_pose (constant
+        # across denoising steps) to avoid ~33 redundant axis_angle_to_matrix
+        # calls inside pose conversion helpers.
+        base_pos = episode_start_pose[:, :3]
+        base_rot = axis_angle_to_matrix(episode_start_pose[:, 3:6])
+        base_rot_t = base_rot.transpose(-2, -1)
 
         model = self.model
         scheduler = self.noise_scheduler
@@ -431,9 +458,13 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         q_cond = None
         if torch.any(cond_step_mask):
             cond_cart = self.normalizer["action"].unnormalize(condition_data)
-            cond_abs_pos, cond_abs_rot = self._relative_pose9_to_absolute(
-                cond_cart[..., :9], episode_start_pose
-            )
+            # Use cached base_rot for rel→abs conversion.
+            _rel9 = cond_cart[..., :9]
+            _rel_pos = _rel9[..., :3]
+            _rel_rot = rot6d_to_matrix(_rel9[..., 3:])
+            cond_abs_pos = (base_rot.unsqueeze(1)
+                            @ _rel_pos.unsqueeze(-1)).squeeze(-1) + base_pos.unsqueeze(1)
+            cond_abs_rot = base_rot.unsqueeze(1) @ _rel_rot
             q_cond_arm = self._ik_from_absolute(cond_abs_pos, cond_abs_rot, q_seed)
             q_cond = torch.cat([q_cond_arm, cond_cart[..., 9:10]], dim=-1)
             q_traj[cond_step_mask] = q_cond[cond_step_mask]
@@ -454,10 +485,17 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
             grip_curr = q_traj[..., self._robot_dof : self._robot_dof + 1]
             abs_pos_curr, abs_rot_curr = self._fk_to_absolute(q_arm_curr)
 
-            rel_pose9_curr = self._absolute_pose_to_relative9(
-                abs_pos_curr, abs_rot_curr, episode_start_pose
+            # ── Relative Cartesian for U-Net (cached base_rot) ──────────
+            rel_pos_curr = (base_rot_t.unsqueeze(1)
+                            @ (abs_pos_curr - base_pos.unsqueeze(1)).unsqueeze(-1)
+                           ).squeeze(-1)
+            rel_rot_curr = base_rot_t.unsqueeze(1) @ abs_rot_curr
+            rel_rot6d_curr = matrix_to_rot6d(
+                rel_rot_curr.reshape(-1, 3, 3)
+            ).reshape(bsz, horizon, 6)
+            cart_phys_curr = torch.cat(
+                [rel_pos_curr, rel_rot6d_curr, grip_curr], dim=-1
             )
-            cart_phys_curr = torch.cat([rel_pose9_curr, grip_curr], dim=-1)
             cart_n_curr = self.normalizer["action"].normalize(cart_phys_curr)
             cart_n_curr[condition_mask] = condition_data[condition_mask]
 
@@ -475,28 +513,17 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
                 cart_n_prev_tgt
             )
 
-            # ── Target absolute pose ────────────────────────────────────
-            abs_pos_tgt, abs_rot_tgt = self._relative_pose9_to_absolute(
-                cart_phys_prev_tgt[..., :9], episode_start_pose,
-            )
+            # ── Target absolute pose (cached base_rot) ──────────────────
+            rel9_tgt = cart_phys_prev_tgt[..., :9]
+            rel_pos_tgt = rel9_tgt[..., :3]
+            rel_rot_tgt = rot6d_to_matrix(rel9_tgt[..., 3:])
+            abs_pos_tgt = (base_rot.unsqueeze(1)
+                           @ rel_pos_tgt.unsqueeze(-1)).squeeze(-1) + base_pos.unsqueeze(1)
+            abs_rot_tgt = base_rot.unsqueeze(1) @ rel_rot_tgt
 
-            # ── World-frame twist (current → target) ────────────────────
-            abs_rot6d_curr = matrix_to_rot6d(
-                abs_rot_curr.reshape(-1, 3, 3)
-            ).reshape(bsz, horizon, 6)
-            abs_pose9_curr_9d = torch.cat(
-                [abs_pos_curr, abs_rot6d_curr], dim=-1
-            )
-
-            abs_rot6d_tgt = matrix_to_rot6d(
-                abs_rot_tgt.reshape(-1, 3, 3)
-            ).reshape(bsz, horizon, 6)
-            abs_pose9_tgt = torch.cat(
-                [abs_pos_tgt, abs_rot6d_tgt], dim=-1
-            )
-
-            twist6 = self._absolute_pose_delta_to_twist6(
-                abs_pose9_curr_9d, abs_pose9_tgt
+            # ── World-frame twist directly from matrices (no rot6d round-trip)
+            twist6 = self._twist6_from_matrices(
+                abs_pos_curr, abs_rot_curr, abs_pos_tgt, abs_rot_tgt
             )
 
             # ── Clamped Jacobian step + reuse sub-iterations ─────────────
@@ -510,26 +537,26 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
                 )
             q_arm_new = q_arm_curr + dq
 
-            # Reuse sub-iterations: same Jacobian, refresh FK + twist
-            for _ in range(2):
-                abs_pos_ri, abs_rot_ri = self._fk_to_absolute(q_arm_new)
-                abs_rot6d_ri = matrix_to_rot6d(
-                    abs_rot_ri.reshape(-1, 3, 3)
-                ).reshape(bsz, horizon, 6)
-                abs_pose9_ri = torch.cat(
-                    [abs_pos_ri, abs_rot6d_ri], dim=-1
-                )
-                twist_ri = self._absolute_pose_delta_to_twist6(
-                    abs_pose9_ri, abs_pose9_tgt
-                )
-                dq_ri = self._dls_pinv_map(
-                    twist_ri.reshape(-1, 6), jac,
-                ).reshape(bsz, horizon, self._robot_dof)
-                if self.max_dq_per_step > 0:
-                    dq_ri = torch.clamp(
-                        dq_ri, -self.max_dq_per_step, self.max_dq_per_step
-                    )
-                q_arm_new = q_arm_new + dq_ri
+            # # Reuse sub-iterations: same Jacobian, refresh FK + twist
+            # for _ in range(2):
+            #     abs_pos_ri, abs_rot_ri = self._fk_to_absolute(q_arm_new)
+            #     abs_rot6d_ri = matrix_to_rot6d(
+            #         abs_rot_ri.reshape(-1, 3, 3)
+            #     ).reshape(bsz, horizon, 6)
+            #     abs_pose9_ri = torch.cat(
+            #         [abs_pos_ri, abs_rot6d_ri], dim=-1
+            #     )
+            #     twist_ri = self._absolute_pose_delta_to_twist6(
+            #         abs_pose9_ri, abs_pose9_tgt
+            #     )
+            #     dq_ri = self._dls_pinv_map(
+            #         twist_ri.reshape(-1, 6), jac,
+            #     ).reshape(bsz, horizon, self._robot_dof)
+            #     if self.max_dq_per_step > 0:
+            #         dq_ri = torch.clamp(
+            #             dq_ri, -self.max_dq_per_step, self.max_dq_per_step
+            #         )
+            #     q_arm_new = q_arm_new + dq_ri
 
             # ── Optional cuRobo IK refine ───────────────────────────────
             is_last = (idx == n_steps - 1)
@@ -570,8 +597,14 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         q_arm_final = q_traj[..., : self._robot_dof]
         grip_final = q_traj[..., self._robot_dof : self._robot_dof + 1]
         abs_p_f, abs_r_f = self._fk_to_absolute(q_arm_final)
-        rel9_f = self._absolute_pose_to_relative9(abs_p_f, abs_r_f, episode_start_pose)
-        cart_final = torch.cat([rel9_f, grip_final], dim=-1)
+        # Use cached base_rot for the final relative-pose conversion.
+        rel_pos_f = (base_rot_t.unsqueeze(1)
+                     @ (abs_p_f - base_pos.unsqueeze(1)).unsqueeze(-1)).squeeze(-1)
+        rel_rot_f = base_rot_t.unsqueeze(1) @ abs_r_f
+        rel_rot6d_f = matrix_to_rot6d(
+            rel_rot_f.reshape(-1, 3, 3)
+        ).reshape(bsz, horizon, 6)
+        cart_final = torch.cat([rel_pos_f, rel_rot6d_f, grip_final], dim=-1)
         cart_final_n = self.normalizer["action"].normalize(cart_final)
         cart_final_n[condition_mask] = condition_data[condition_mask]
         if return_debug:

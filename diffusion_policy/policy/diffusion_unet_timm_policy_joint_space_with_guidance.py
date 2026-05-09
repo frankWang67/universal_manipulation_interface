@@ -23,7 +23,13 @@ from diffusion_policy.common.guided_diffusion_util import (
 )
 from diffusion_policy.policy.diffusion_unet_timm_policy_joint_space import DiffusionUnetTimmPolicyJointSpace
 
-from mani_skill.utils.geometry.rotation_conversions import matrix_to_rotation_6d as matrix_to_rot6d
+from mani_skill.utils.geometry.rotation_conversions import (
+    axis_angle_to_matrix,
+    matrix_to_axis_angle,
+    matrix_to_rotation_6d as matrix_to_rot6d,
+    quaternion_to_matrix,
+    rotation_6d_to_matrix as rot6d_to_matrix,
+)
 
 
 class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJointSpace):
@@ -59,6 +65,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         guidance_sdf_topk: int = 4,
         guidance_task_pos_weight: float = 1.0,
         guidance_task_rot_weight: float = 1.0,
+        guidance_reuse_jacobian: bool = True,
         **kwargs,
     ):
         if robot_cfg_name is None:
@@ -110,6 +117,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                 "Use one of: ['cbf', 'gd', 'gradient_descent']"
             )
         self.guidance_method = guidance_method
+        self.guidance_reuse_jacobian = bool(guidance_reuse_jacobian)
 
         self._world_collision = None
         self._coll_query_buffer = None
@@ -584,6 +592,11 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             dtype=condition_data.dtype,
         )
 
+        # Pre-compute base coordinate frame (constant across denoising steps).
+        base_pos = episode_start_pose[:, :3]
+        base_rot = axis_angle_to_matrix(episode_start_pose[:, 3:6])
+        base_rot_t = base_rot.transpose(-2, -1)
+
         model = self.model
         scheduler = self.noise_scheduler
         bsz = condition_data.shape[0]
@@ -658,9 +671,13 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         q_cond = None
         if torch.any(cond_step_mask):
             cond_cart = self.normalizer["action"].unnormalize(condition_data)
-            cond_abs_pos, cond_abs_rot = self._relative_pose9_to_absolute(
-                cond_cart[..., :9], episode_start_pose
-            )
+            # Use cached base_rot for rel→abs conversion.
+            _rel9 = cond_cart[..., :9]
+            _rel_pos = _rel9[..., :3]
+            _rel_rot = rot6d_to_matrix(_rel9[..., 3:])
+            cond_abs_pos = (base_rot.unsqueeze(1)
+                            @ _rel_pos.unsqueeze(-1)).squeeze(-1) + base_pos.unsqueeze(1)
+            cond_abs_rot = base_rot.unsqueeze(1) @ _rel_rot
             q_cond_arm = self._ik_from_absolute(cond_abs_pos, cond_abs_rot, q_seed)
             q_cond = torch.cat([q_cond_arm, cond_cart[..., 9:10]], dim=-1)
             q_traj[cond_step_mask] = q_cond[cond_step_mask]
@@ -684,8 +701,17 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             grip_curr = q_traj[..., self._robot_dof : self._robot_dof + 1]
             abs_pos_curr, abs_rot_curr = self._fk_to_absolute(q_arm_curr)
 
-            rel_pose9_curr = self._absolute_pose_to_relative9(abs_pos_curr, abs_rot_curr, episode_start_pose)
-            cart_phys_curr = torch.cat([rel_pose9_curr, grip_curr], dim=-1)
+            # ── Relative Cartesian for U-Net (cached base_rot) ──────────
+            rel_pos_curr = (base_rot_t.unsqueeze(1)
+                            @ (abs_pos_curr - base_pos.unsqueeze(1)).unsqueeze(-1)
+                           ).squeeze(-1)
+            rel_rot_curr = base_rot_t.unsqueeze(1) @ abs_rot_curr
+            rel_rot6d_curr = matrix_to_rot6d(
+                rel_rot_curr.reshape(-1, 3, 3)
+            ).reshape(bsz, horizon, 6)
+            cart_phys_curr = torch.cat(
+                [rel_pos_curr, rel_rot6d_curr, grip_curr], dim=-1
+            )
             cart_n_curr = self.normalizer["action"].normalize(cart_phys_curr)
             cart_n_curr[condition_mask] = condition_data[condition_mask]
 
@@ -710,33 +736,38 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             cart_n_prev_tgt[condition_mask] = condition_data[condition_mask]
             cart_phys_prev_tgt = self.normalizer["action"].unnormalize(cart_n_prev_tgt)
 
-            abs_pos_tgt, abs_rot_tgt = self._relative_pose9_to_absolute(
-                cart_phys_prev_tgt[..., :9], episode_start_pose
+            # ── Target absolute pose (cached base_rot) ──────────────────
+            rel9_tgt = cart_phys_prev_tgt[..., :9]
+            rel_pos_tgt = rel9_tgt[..., :3]
+            rel_rot_tgt = rot6d_to_matrix(rel9_tgt[..., 3:])
+            abs_pos_tgt = (base_rot.unsqueeze(1)
+                           @ rel_pos_tgt.unsqueeze(-1)).squeeze(-1) + base_pos.unsqueeze(1)
+            abs_rot_tgt = base_rot.unsqueeze(1) @ rel_rot_tgt
+
+            # ── World-frame twist directly from matrices (no rot6d round-trip)
+            twist6 = self._twist6_from_matrices(
+                abs_pos_curr, abs_rot_curr, abs_pos_tgt, abs_rot_tgt
             )
 
-            abs_rot6d_curr = matrix_to_rot6d(abs_rot_curr.reshape(-1, 3, 3)).reshape(bsz, horizon, 6)
-            abs_pose9_curr_9d = torch.cat([abs_pos_curr, abs_rot6d_curr], dim=-1)
-
-            abs_rot6d_tgt = matrix_to_rot6d(abs_rot_tgt.reshape(-1, 3, 3)).reshape(bsz, horizon, 6)
-            abs_pose9_tgt = torch.cat([abs_pos_tgt, abs_rot6d_tgt], dim=-1)
-
-            twist6 = self._absolute_pose_delta_to_twist6(abs_pose9_curr_9d, abs_pose9_tgt)
-
             jac = self._jacobian(q_arm_curr)
+            # Cache Jacobian and reference state for possible CBF reuse.
+            # q_arm_curr is used as the reference because jac = J(q_arm_curr).
+            jac_ref = jac
+            q_ref_for_jac = q_arm_curr
             dq = self._dls_pinv_map(twist6.reshape(-1, 6), jac).reshape(bsz, horizon, self._robot_dof)
             if self.max_dq_per_step > 0:
                 dq = torch.clamp(dq, -self.max_dq_per_step, self.max_dq_per_step)
             q_arm_new = q_arm_curr + dq
 
-            for _ in range(2):
-                abs_pos_ri, abs_rot_ri = self._fk_to_absolute(q_arm_new)
-                abs_rot6d_ri = matrix_to_rot6d(abs_rot_ri.reshape(-1, 3, 3)).reshape(bsz, horizon, 6)
-                abs_pose9_ri = torch.cat([abs_pos_ri, abs_rot6d_ri], dim=-1)
-                twist_ri = self._absolute_pose_delta_to_twist6(abs_pose9_ri, abs_pose9_tgt)
-                dq_ri = self._dls_pinv_map(twist_ri.reshape(-1, 6), jac).reshape(bsz, horizon, self._robot_dof)
-                if self.max_dq_per_step > 0:
-                    dq_ri = torch.clamp(dq_ri, -self.max_dq_per_step, self.max_dq_per_step)
-                q_arm_new = q_arm_new + dq_ri
+            # for _ in range(2):
+            #     abs_pos_ri, abs_rot_ri = self._fk_to_absolute(q_arm_new)
+            #     abs_rot6d_ri = matrix_to_rot6d(abs_rot_ri.reshape(-1, 3, 3)).reshape(bsz, horizon, 6)
+            #     abs_pose9_ri = torch.cat([abs_pos_ri, abs_rot6d_ri], dim=-1)
+            #     twist_ri = self._absolute_pose_delta_to_twist6(abs_pose9_ri, abs_pose9_tgt)
+            #     dq_ri = self._dls_pinv_map(twist_ri.reshape(-1, 6), jac).reshape(bsz, horizon, self._robot_dof)
+            #     if self.max_dq_per_step > 0:
+            #         dq_ri = torch.clamp(dq_ri, -self.max_dq_per_step, self.max_dq_per_step)
+            #     q_arm_new = q_arm_new + dq_ri
 
             is_last = idx == (n_steps - 1)
             if self.ik_refine_each_step or (is_last and self.ik_refine_last_step):
@@ -763,9 +794,25 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                     if self.guidance_method == "cbf":
                         tg = time.perf_counter()
                         h_value, grad_h, _dist_signed = self._compute_cbf_linearization(q_guidance_state)
-                        jac_lin = self._jacobian(q_guidance_state).reshape(
-                            bsz, horizon, 6, self._robot_dof
-                        )
+                        # Reuse the denoising-step Jacobian when the
+                        # guidance query state is close to the reference
+                        # state, avoiding a redundant ~9 ms computation.
+                        if (
+                            self.guidance_reuse_jacobian
+                            and not self.guidance_use_clean_sample
+                            and q_ref_for_jac is not None
+                        ):
+                            state_change = (q_guidance_state - q_ref_for_jac).abs().max()
+                            if state_change < 0.5:
+                                jac_lin = jac_ref.reshape(bsz, horizon, 6, self._robot_dof)
+                            else:
+                                jac_lin = self._jacobian(q_guidance_state).reshape(
+                                    bsz, horizon, 6, self._robot_dof
+                                )
+                        else:
+                            jac_lin = self._jacobian(q_guidance_state).reshape(
+                                bsz, horizon, 6, self._robot_dof
+                            )
                         gamma = self._guidance_scale_at(
                             idx=idx,
                             n_steps=n_steps,
@@ -883,8 +930,14 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         q_arm_final = q_traj[..., : self._robot_dof]
         grip_final = q_traj[..., self._robot_dof : self._robot_dof + 1]
         abs_p_f, abs_r_f = self._fk_to_absolute(q_arm_final)
-        rel9_f = self._absolute_pose_to_relative9(abs_p_f, abs_r_f, episode_start_pose)
-        cart_final = torch.cat([rel9_f, grip_final], dim=-1)
+        # Use cached base_rot for the final relative-pose conversion.
+        rel_pos_f = (base_rot_t.unsqueeze(1)
+                     @ (abs_p_f - base_pos.unsqueeze(1)).unsqueeze(-1)).squeeze(-1)
+        rel_rot_f = base_rot_t.unsqueeze(1) @ abs_r_f
+        rel_rot6d_f = matrix_to_rot6d(
+            rel_rot_f.reshape(-1, 3, 3)
+        ).reshape(bsz, horizon, 6)
+        cart_final = torch.cat([rel_pos_f, rel_rot6d_f, grip_final], dim=-1)
         cart_final_n = self.normalizer["action"].normalize(cart_final)
         cart_final_n[condition_mask] = condition_data[condition_mask]
 
