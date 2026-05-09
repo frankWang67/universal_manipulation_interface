@@ -16,6 +16,10 @@ from curobo.geom.types import WorldConfig, Cuboid
 from curobo.util_file import get_robot_configs_path, get_assets_path, join_path, load_yaml
 
 from diffusion_policy.common.pytorch_util import dict_apply
+
+# Enable Dynamo tracing of data-dependent shape operators (same as joint_space).
+torch._dynamo.config.capture_dynamic_output_shape_ops = True
+
 from diffusion_policy.common.guided_diffusion_util import (
     get_guidance_strength,
     flatten_obstacle_info,
@@ -194,6 +198,39 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
 
         if self.arm_dof <= 0:
             self.arm_dof = int(self._pk_chain.n_joints)
+
+        # One-time torch.compile of hot-path functions (including CBF QP).
+        DiffusionUnetTimmPolicyJointSpace._compile_hot_functions(self, device)
+        self._compile_cbf_functions(device)
+
+    def _compile_cbf_functions(self, device: torch.device):
+        """Compile CBF QP solver (the only CBF hot-path function safe for compile)."""
+        if getattr(self, "_compile_cbf_done", False):
+            return
+        self._compile_cbf_done = True
+
+        robot_dof = int(self._robot_dof)
+        arm_dof = min(max(int(self.arm_dof), 1), robot_dof)
+        bsz, horizon = 1, 16
+
+        dummy_jac = torch.randn(bsz, horizon, 6, robot_dof, device=device, dtype=torch.float32)
+        dummy_grad_h = torch.randn(bsz, horizon, robot_dof, device=device, dtype=torch.float32)
+        dummy_h = torch.randn(bsz, horizon, device=device, dtype=torch.float32)
+
+        def _cbf_qp_wrapper(jac, grad_h, h_value, constraint_scale):
+            return self._solve_batched_cbf_qp(
+                jac_pos=jac,
+                grad_h=grad_h,
+                h_value=h_value,
+                constraint_scale=constraint_scale,
+            )
+
+        compiled_qp = torch.compile(
+            _cbf_qp_wrapper, fullgraph=True, mode="reduce-overhead",
+        )
+        dummy_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+        _ = compiled_qp(dummy_jac, dummy_grad_h, dummy_h, dummy_scale)  # trigger compilation
+        self._cbf_qp_fn = compiled_qp
 
     def _build_world_collision(
         self,
@@ -745,9 +782,9 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             abs_rot_tgt = base_rot.unsqueeze(1) @ rel_rot_tgt
 
             # ── World-frame twist directly from matrices (no rot6d round-trip)
-            twist6 = self._twist6_from_matrices(
+            twist6 = self._twist_fn(
                 abs_pos_curr, abs_rot_curr, abs_pos_tgt, abs_rot_tgt
-            )
+            ).clone()
 
             jac = self._jacobian(q_arm_curr)
             # Cache Jacobian and reference state for possible CBF reuse.
@@ -820,11 +857,8 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                             dtype=q_arm_new.dtype,
                             device=q_arm_new.device,
                         )
-                        dq_cbf, _rhs, _denom, _feasible = self._solve_batched_cbf_qp(
-                            jac_pos=jac_lin,
-                            grad_h=grad_h,
-                            h_value=h_value,
-                            constraint_scale=gamma,
+                        dq_cbf, _rhs, _denom, _feasible = self._cbf_qp_fn(
+                            jac_lin, grad_h, h_value, gamma,
                         )
                         timing["guidance_grad"] += time.perf_counter() - tg
 

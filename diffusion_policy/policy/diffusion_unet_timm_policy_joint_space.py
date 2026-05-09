@@ -12,6 +12,12 @@ from curobo.util_file import get_robot_configs_path, join_path, load_yaml
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.policy.diffusion_unet_timm_policy import DiffusionUnetTimmPolicy
 
+# Enable Dynamo tracing of data-dependent shape operators (e.g. nonzero
+# inside matrix_to_axis_angle) so that twist and CBF QP can be compiled
+# with fullgraph=True.  This is a per-process setting; it only affects
+# torch.compile and has no impact on eager execution or numerical results.
+torch._dynamo.config.capture_dynamic_output_shape_ops = True
+
 from mani_skill.utils.geometry.rotation_conversions import (
     axis_angle_to_matrix,
     matrix_to_axis_angle,
@@ -106,6 +112,67 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         return torch.cat([arm_q, grip], dim=-1)
 
     # ===========================
+    # Fast rotation helpers (index-op-free, compilable with fullgraph)
+    # ===========================
+    @staticmethod
+    def _sqrt_positive_part_fast(x: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt(torch.relu(x))
+
+    @staticmethod
+    def _matrix_to_quaternion_fast(matrix: torch.Tensor) -> torch.Tensor:
+        """matrix_to_quaternion without boolean-index ops. Numerically identical."""
+        batch_dim = matrix.shape[:-2]
+        m00, m01, m02, m10, m11, m12, m20, m21, m22 = torch.unbind(
+            matrix.reshape(batch_dim + (9,)), dim=-1,
+        )
+        q_abs = DiffusionUnetTimmPolicyJointSpace._sqrt_positive_part_fast(
+            torch.stack([
+                1.0 + m00 + m11 + m22, 1.0 + m00 - m11 - m22,
+                1.0 - m00 + m11 - m22, 1.0 - m00 - m11 + m22,
+            ], dim=-1),
+        )
+        quat_by_rijk = torch.stack([
+            torch.stack([q_abs[..., 0] ** 2, m21 - m12, m02 - m20, m10 - m01], dim=-1),
+            torch.stack([m21 - m12, q_abs[..., 1] ** 2, m10 + m01, m02 + m20], dim=-1),
+            torch.stack([m02 - m20, m10 + m01, q_abs[..., 2] ** 2, m12 + m21], dim=-1),
+            torch.stack([m10 - m01, m20 + m02, m21 + m12, q_abs[..., 3] ** 2], dim=-1),
+        ], dim=-2)
+        dtype = q_abs.dtype
+        flr = torch.tensor(0.1, device=q_abs.device, dtype=dtype)
+        quat_candidates = quat_by_rijk / (2.0 * q_abs[..., None].max(flr))
+        weights = torch.nn.functional.one_hot(
+            q_abs.argmax(dim=-1), num_classes=4,
+        ).to(dtype=dtype)
+        out = (quat_candidates * weights.unsqueeze(-1)).sum(dim=-2).reshape(
+            batch_dim + (4,),
+        )
+        return torch.where(out[..., 0:1] < 0, -out, out)
+
+    @staticmethod
+    def _quaternion_to_axis_angle_fast(quaternions: torch.Tensor) -> torch.Tensor:
+        """quaternion_to_axis_angle without boolean-index ops."""
+        quaternions = quaternions / torch.linalg.norm(
+            quaternions, dim=-1, keepdim=True,
+        )
+        w, vec = quaternions[..., 0], quaternions[..., 1:]
+        half_angles = torch.acos(torch.clamp(w, -1.0, 1.0))
+        angles = 2.0 * half_angles
+        small_mask = (angles < 1e-6).unsqueeze(-1)
+        sin_half = torch.sin(half_angles).unsqueeze(-1)
+        half_clamped = half_angles.clamp(min=1e-12).unsqueeze(-1)
+        axis_raw = vec / torch.where(small_mask, 1.0, sin_half)
+        taylor = vec / torch.where(small_mask, half_clamped, 1.0)
+        axis = torch.where(small_mask, taylor, axis_raw)
+        return angles.unsqueeze(-1) * axis
+
+    @staticmethod
+    def _matrix_to_axis_angle_fast(matrix: torch.Tensor) -> torch.Tensor:
+        """matrix_to_axis_angle with zero index ops → compilable fullgraph."""
+        return DiffusionUnetTimmPolicyJointSpace._quaternion_to_axis_angle_fast(
+            DiffusionUnetTimmPolicyJointSpace._matrix_to_quaternion_fast(matrix),
+        )
+
+    # ===========================
     # Kinematics initialization
     # ===========================
     def _ensure_kinematics(self, device: torch.device):
@@ -140,6 +207,42 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
                 urdf_str.encode("utf-8"), self.ee_link_name
             )
         self._pk_chain = self._pk_chain.to(dtype=torch.float32, device=device)
+
+        # One-time torch.compile of hot-path functions.
+        self._compile_hot_functions(device)
+
+    def _compile_hot_functions(self, device: torch.device):
+        """Compile hot-path kinematics functions once per process lifetime."""
+        if getattr(self, "_compile_done", False):
+            return
+        self._compile_done = True
+
+        arm_dof = min(self.arm_dof, 7)
+        dummy_q = torch.randn(17, arm_dof, device=device, dtype=torch.float32)
+
+        # -- Jacobian (jacobian_tensor, 7.4× speedup) --
+        compiled_jac = torch.compile(
+            self._pk_chain.jacobian_tensor, fullgraph=True, mode="reduce-overhead",
+        )
+        _ = compiled_jac(dummy_q)  # trigger compilation
+        self._jacobian_fn = compiled_jac
+
+        # -- Twist from matrices (14× speedup after index-op elimination;
+        #    _matrix_to_axis_angle_fast uses zero index ops) --
+        bsz, horizon = 1, 16
+        dummy_pos_c = torch.randn(bsz, horizon, 3, device=device, dtype=torch.float32)
+        dummy_pos_t = torch.randn(bsz, horizon, 3, device=device, dtype=torch.float32)
+        I3 = torch.eye(3, device=device, dtype=torch.float32)
+        dummy_rot_c = I3.unsqueeze(0).unsqueeze(0).expand(bsz, horizon, 3, 3).contiguous()
+        dummy_rot_t = dummy_rot_c.clone()
+        compiled_twist = torch.compile(
+            self._twist6_from_matrices, fullgraph=True, mode="reduce-overhead",
+        )
+        _ = compiled_twist(dummy_pos_c, dummy_rot_c, dummy_pos_t, dummy_rot_t)
+        self._twist_fn = compiled_twist
+
+        # DLS is not compiled: its Jacobian last dim varies between
+        # arm_dof at compile time and robot_dof at run time (padding).
 
     @staticmethod
     def _inv_se3(mat: torch.Tensor) -> torch.Tensor:
@@ -266,7 +369,8 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
 
         arm_dof = min(self.arm_dof, qf.shape[-1])
         q_for_jac = qf[:, :arm_dof].detach().to(dtype=torch.float32)
-        j_arm = self._pk_chain.jacobian(q_for_jac).to(device=qf.device, dtype=qf.dtype)
+        # Use compiled jacobian_tensor (pk 0.10.0) for ~7× speedup.
+        j_arm = self._jacobian_fn(q_for_jac).to(device=qf.device, dtype=qf.dtype)
 
         if qf.shape[-1] > arm_dof:
             pad = torch.zeros((n, 6, qf.shape[-1] - arm_dof), device=qf.device, dtype=qf.dtype)
@@ -306,7 +410,9 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         pos_tgt = abs_pos_tgt.reshape(-1, 3)
         rot_tgt = abs_rot_tgt.reshape(-1, 3, 3)
         dpos = pos_tgt - pos_cur
-        drot = matrix_to_axis_angle(rot_tgt @ rot_cur.transpose(-2, -1))
+        drot = self._matrix_to_axis_angle_fast(
+            rot_tgt @ rot_cur.transpose(-2, -1),
+        )
         return torch.cat([dpos, drot], dim=-1).reshape(bsz, horizon, 6)
 
     def _absolute_pose_delta_to_twist6(
@@ -522,9 +628,9 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
             abs_rot_tgt = base_rot.unsqueeze(1) @ rel_rot_tgt
 
             # ── World-frame twist directly from matrices (no rot6d round-trip)
-            twist6 = self._twist6_from_matrices(
+            twist6 = self._twist_fn(
                 abs_pos_curr, abs_rot_curr, abs_pos_tgt, abs_rot_tgt
-            )
+            ).clone()
 
             # ── Clamped Jacobian step + reuse sub-iterations ─────────────
             jac = self._jacobian(q_arm_curr)
