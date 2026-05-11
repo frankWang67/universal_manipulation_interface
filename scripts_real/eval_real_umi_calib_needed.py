@@ -56,6 +56,7 @@ from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from umi.common.precise_sleep import precise_wait
+from umi.common.pose_util import pose_to_mat, mat_to_pose
 from umi.real_world.umi_env import UmiEnv
 from umi.real_world.keystroke_counter import (
     KeystrokeCounter, Key, KeyCode
@@ -63,20 +64,18 @@ from umi.real_world.keystroke_counter import (
 from umi.real_world.real_inference_util import (get_real_obs_dict,
                                                 get_real_obs_resolution,
                                                 get_real_umi_obs_dict,
-                                                get_real_umi_action)
-from umi.real_world.spacemouse_shared_memory import Spacemouse
+                                                get_real_umi_action,
+                                                wait_until_still)
+# from umi.real_world.spacemouse_shared_memory import Spacemouse
+from umi.real_world.keyboard_spacemouse_shared_memory import KeyboardSpacemouse as Spacemouse
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 @click.command()
 @click.option('--input', '-i', required=True, help='Path to checkpoint')
 @click.option('--output', '-o', required=True, help='Directory to save recording')
-# @click.option('--robot_ip', '-ri', default='172.24.95.9')
-# @click.option('--gripper_ip', '-gi', default='172.24.95.17')
-@click.option('--robot_ip', default='192.168.0.9')
+@click.option('--robot_ip', default='192.168.54.130')
 @click.option('--gripper_ip', default='192.168.0.27')
-# @click.option('--robot_ip', default='172.16.0.3')
-# @click.option('--gripper_ip', default='172.24.95.27')
 @click.option('--match_dataset', '-m', default=None, help='Dataset used to overlay and adjust initial condition')
 @click.option('--match_episode', '-me', default=None, type=int, help='Match specific episode from the match dataset')
 @click.option('--match_camera', '-mc', default=0, type=int)
@@ -93,6 +92,8 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('-rt', '--robot_type', default='ur5')
 @click.option('--mirror_crop', is_flag=True, default=False)
 @click.option('--mirror_swap', is_flag=True, default=False)
+@click.option('--calibration_file', '-cf', required=True, type=str, help="Path to the hand-eye calibration file.")
+@click.option('--blocking', '-b', is_flag=True, default=False, help="Whether to use blocking execution mode.")
 def main(input, output, robot_ip, gripper_ip, 
     match_dataset, match_episode, match_camera,
     camera_reorder,
@@ -100,7 +101,35 @@ def main(input, output, robot_ip, gripper_ip,
     steps_per_inference, max_duration,
     frequency, command_latency, 
     no_mirror, sim_fov, camera_intrinsics, robot_type, 
-    mirror_crop, mirror_swap):
+    mirror_crop, mirror_swap, calibration_file, blocking):
+
+    # 加载标定矩阵
+    with open(calibration_file, 'r') as f:
+        calib_data = json.load(f)
+    T_base_tag = np.array(calib_data['tx_base2world'])
+    T_tag_base = np.linalg.inv(T_base_tag)
+    
+    # 定义一个转换函数，方便后续使用
+    def tag_pose_to_base(pose_tag):
+        T_tag_eef = pose_to_mat(pose_tag)
+        T_base_eef = T_tag_base @ T_tag_eef
+        return mat_to_pose(T_base_eef)
+    
+    def base_pose_to_tag(pose_base):
+        T_base_eef = pose_to_mat(pose_base)
+        T_tag_eef = T_base_tag @ T_base_eef
+        return mat_to_pose(T_tag_eef)
+    
+    def convert_obs(obs):
+        for i in range(len(obs['robot0_eef_pos'])):
+            pos = obs['robot0_eef_pos'][i]
+            rot = obs['robot0_eef_rot_axis_angle'][i]
+            pose = np.concatenate([pos, rot])
+            virtual_pose = base_pose_to_tag(pose)
+            obs['robot0_eef_pos'][i] = virtual_pose[:3]
+            obs['robot0_eef_rot_axis_angle'][i] = virtual_pose[3:]
+        return obs
+
     max_gripper_width = 0.09
     gripper_speed = 0.2
 
@@ -130,6 +159,21 @@ def main(input, output, robot_ip, gripper_ip,
         )
 
     print("steps_per_inference:", steps_per_inference)
+    if not blocking:
+        print("Using async execution mode.")
+        camera_obs_latency = 0.1327
+        robot_obs_latency = 0.0001
+        gripper_obs_latency = 0.015
+        robot_action_latency = 0.3
+        gripper_action_latency = 0.03
+    else:
+        print("Using blocking execution mode.")
+        camera_obs_latency = 0.0
+        robot_obs_latency = 0.0
+        gripper_obs_latency = 0.0
+        robot_action_latency = 0.0
+        gripper_action_latency = 0.0
+
     with SharedMemoryManager() as shm_manager:
         with Spacemouse(shm_manager=shm_manager) as sm, \
             KeystrokeCounter() as key_counter, \
@@ -144,16 +188,11 @@ def main(input, output, robot_ip, gripper_ip,
                 init_joints=init_joints,
                 enable_multi_cam_vis=True,
                 # latency
-                camera_obs_latency=0.17,
-                robot_obs_latency=0.0001,
-                gripper_obs_latency=0.01,
-                robot_action_latency=0.18,
-                gripper_action_latency=0.1,
-                # camera_obs_latency=0.0,
-                # robot_obs_latency=0.0,
-                # gripper_obs_latency=0.0,
-                # robot_action_latency=0.0,
-                # gripper_action_latency=0.0,
+                camera_obs_latency=camera_obs_latency,
+                robot_obs_latency=robot_obs_latency,
+                gripper_obs_latency=gripper_obs_latency,
+                robot_action_latency=robot_action_latency,
+                gripper_action_latency=gripper_action_latency,
                 # obs
                 camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
                 robot_obs_horizon=cfg.task.shape_meta.obs.robot0_eef_pos.horizon,
@@ -217,11 +256,19 @@ def main(input, output, robot_ip, gripper_ip,
 
             print("Warming up policy inference")
             obs = env.get_obs()
+            obs = convert_obs(obs)
             with torch.no_grad():
                 policy.reset()
+                # [新增] 获取当前位姿作为临时的 start_pose 用于预热
+                episode_start_pose = [np.concatenate([
+                    obs['robot0_eef_pos'][-1], 
+                    obs['robot0_eef_rot_axis_angle'][-1]
+                ])]
                 obs_dict_np = get_real_umi_obs_dict(
                     env_obs=obs, shape_meta=cfg.task.shape_meta, 
-                    obs_pose_repr=obs_pose_rep)
+                    obs_pose_repr=obs_pose_rep,
+                    episode_start_pose=episode_start_pose
+                )
                 obs_dict = dict_apply(obs_dict_np, 
                     lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                 result = policy.predict_action(obs_dict)
@@ -249,6 +296,7 @@ def main(input, output, robot_ip, gripper_ip,
 
                     # pump obs
                     obs = env.get_obs()
+                    obs = convert_obs(obs)
 
                     # visualize
                     episode_id = env.replay_buffer.n_episodes
@@ -339,14 +387,14 @@ def main(input, output, robot_ip, gripper_ip,
                     # get teleop command
                     sm_state = sm.get_motion_state_transformed()
                     # print(sm_state)
-                    dpos = sm_state[:3] * (0.5 / frequency)
-                    drot_xyz = sm_state[3:] * (1.5 / frequency)
+                    dpos = sm_state[:3] * (0.1 / frequency)
+                    drot_xyz = sm_state[3:] * (0.3 / frequency)
 
                     drot = st.Rotation.from_euler('xyz', drot_xyz)
                     target_pose[:3] += dpos
                     target_pose[3:] = (drot * st.Rotation.from_rotvec(
                         target_pose[3:])).as_rotvec()
-                    target_pose[2] = np.maximum(target_pose[2], 0.055)
+                    # target_pose[2] = np.maximum(target_pose[2], 0.055)
                     
                     dpos = 0
                     if sm.is_button_pressed(0):
@@ -389,21 +437,37 @@ def main(input, output, robot_ip, gripper_ip,
 
                         # get obs
                         obs = env.get_obs()
+                        obs = convert_obs(obs)
+                        episode_start_pose = [np.concatenate([
+                            obs['robot0_eef_pos'][-1], 
+                            obs['robot0_eef_rot_axis_angle'][-1]
+                        ])]
                         obs_timestamps = obs['timestamp']
-                        print(f'Obs latency {time.time() - obs_timestamps[-1]}')
+                        # print(f'Obs latency {time.time() - obs_timestamps[-1]}')
 
                         # run inference
                         with torch.no_grad():
                             s = time.time()
                             obs_dict_np = get_real_umi_obs_dict(
                                 env_obs=obs, shape_meta=cfg.task.shape_meta, 
-                                obs_pose_repr=obs_pose_rep)
+                                obs_pose_repr=obs_pose_rep,
+                                episode_start_pose=episode_start_pose,
+                            )
                             obs_dict = dict_apply(obs_dict_np, 
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             result = policy.predict_action(obs_dict)
                             raw_action = result['action_pred'][0].detach().to('cpu').numpy()
                             action = get_real_umi_action(raw_action, obs, action_pose_repr)
-                            print('Inference latency:', time.time() - s)
+                            # print('Inference latency:', time.time() - s)
+
+                        # === [新增修复代码] 强制夹爪动作相对化 ===
+                        current_gripper_width = obs['robot0_gripper_width'][-1]
+                        pred_gripper_traj = action[:, -1]
+                        shift = current_gripper_width - pred_gripper_traj[0]
+                        new_gripper_traj = pred_gripper_traj + shift
+                        new_gripper_traj = np.clip(new_gripper_traj, 0, env.gripper.gripper.width)
+                        action[:, -1] = new_gripper_traj
+                        # ==========================================
                         
                         # convert policy action to env actions
                         this_target_poses = action
@@ -429,12 +493,19 @@ def main(input, output, robot_ip, gripper_ip,
                             action_timestamps = action_timestamps[is_new]
 
                         # execute actions
+                        for i in range(len(this_target_poses)):
+                            this_target_poses[i,:6] = tag_pose_to_base(this_target_poses[i,:6])
                         env.exec_actions(
                             actions=this_target_poses,
                             timestamps=action_timestamps,
                             compensate_latency=True
                         )
-                        print(f"Submitted {len(this_target_poses)} steps of actions.")
+                        # print(f"Submitted {len(this_target_poses)} steps of actions.")
+
+                        if blocking:
+                            action_duration = action.shape[1] * dt
+                            time.sleep(action_duration * 0.8)
+                            wait_until_still(env, velocity_threshold=0.0001, timeout=5.0)
 
                         # visualize
                         episode_id = env.replay_buffer.n_episodes
@@ -476,9 +547,10 @@ def main(input, output, robot_ip, gripper_ip,
                             env.end_episode()
                             break
 
-                        # wait for execution
-                        precise_wait(t_cycle_end - frame_latency)
-                        iter_idx += steps_per_inference
+                        if not blocking:
+                            # wait for execution
+                            precise_wait(t_cycle_end - frame_latency)
+                            iter_idx += steps_per_inference
 
                 except KeyboardInterrupt:
                     print("Interrupted!")

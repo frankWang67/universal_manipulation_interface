@@ -26,7 +26,7 @@ dependencies:
     - scipy==1.11
     - numba==0.57
     - pandas==2.1
-    - opencv-python==4.7.0.72
+    - opencv-contrib-python==4.7.0.72
     - ipykernel==6.23
     - matplotlib==3.7
     - k3d==2.15
