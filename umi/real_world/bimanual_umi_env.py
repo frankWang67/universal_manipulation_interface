@@ -7,6 +7,7 @@ import math
 from multiprocessing.managers import SharedMemoryManager
 from umi.real_world.rtde_interpolation_controller import RTDEInterpolationController
 from umi.real_world.wsg_controller import WSGController
+from umi.real_world.robotiq_controller import RobotiqController
 from umi.real_world.franka_interpolation_controller import FrankaInterpolationController
 from umi.real_world.multi_uvc_camera import MultiUvcCamera, VideoRecorder
 from diffusion_policy.common.timestamp_accumulator import (
@@ -119,7 +120,8 @@ class BimanualUmiEnv:
                     return data
                 transform.append(tf4k)
             else:
-                res = (1920, 1080)
+                # res = (1920, 1080)
+                res = (1280, 720)
                 fps = 60
                 buf = 1
                 bit_rate = 3000*1000
@@ -245,13 +247,19 @@ class BimanualUmiEnv:
             robots.append(this_robot)
 
         for gc in grippers_config:
-            this_gripper = WSGController(
-                shm_manager=shm_manager,
-                hostname=gc['gripper_ip'],
-                port=gc['gripper_port'],
-                receive_latency=gc['gripper_obs_latency'],
-                use_meters=True
-            )
+            if gc['gripper_type'] == 'wsg50':
+                this_gripper = WSGController(
+                    shm_manager=shm_manager,
+                    hostname=gc['gripper_ip'],
+                    port=gc['gripper_port'],
+                    receive_latency=gc['gripper_obs_latency'],
+                    use_meters=True
+                )
+            elif gc['gripper_type'] == 'robotiq':
+                this_gripper = RobotiqController(
+                    shm_manager=shm_manager,
+                    receive_latency=gc['gripper_obs_latency'],
+                )
 
             grippers.append(this_gripper)
 

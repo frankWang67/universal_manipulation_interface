@@ -459,15 +459,6 @@ def main(input, output, robot_ip, gripper_ip,
                             raw_action = result['action_pred'][0].detach().to('cpu').numpy()
                             action = get_real_umi_action(raw_action, obs, action_pose_repr)
                             # print('Inference latency:', time.time() - s)
-
-                        # === [新增修复代码] 强制夹爪动作相对化 ===
-                        current_gripper_width = obs['robot0_gripper_width'][-1]
-                        pred_gripper_traj = action[:, -1]
-                        shift = current_gripper_width - pred_gripper_traj[0]
-                        new_gripper_traj = pred_gripper_traj + shift
-                        new_gripper_traj = np.clip(new_gripper_traj, 0, env.gripper.gripper.width)
-                        action[:, -1] = new_gripper_traj
-                        # ==========================================
                         
                         # convert policy action to env actions
                         this_target_poses = action

@@ -10,12 +10,14 @@ class KeyboardSpacemouse(mp.Process):
             shm_manager, 
             get_max_k=30, 
             frequency=200, 
+            launch_timeout=3.0,
             deadzone=0.05, # 保持接口一致，虽然键盘不需要死区
             dtype=np.float32, 
             n_buttons=2, 
             verbose=False):
         super().__init__(name="KeyboardSpacemouse", daemon=True)
         self.frequency = frequency
+        self.launch_timeout = launch_timeout
         self.verbose = verbose
         self.n_buttons = n_buttons
         self.dtype = dtype
@@ -41,7 +43,14 @@ class KeyboardSpacemouse(mp.Process):
     def start(self, wait=True):
         super().start()
         if wait:
-            self.ready_event.wait()
+            self.ready_event.wait(self.launch_timeout)
+            if not self.ready_event.is_set():
+                raise RuntimeError(
+                    "KeyboardSpacemouse failed to become ready within "
+                    f"{self.launch_timeout}s. This usually means the "
+                    "pynput keyboard listener could not start."
+                )
+            assert self.is_alive()
 
     def stop(self):
         self.stop_event.set()

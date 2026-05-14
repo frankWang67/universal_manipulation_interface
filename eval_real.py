@@ -56,7 +56,8 @@ from umi.real_world.real_inference_util import (get_real_obs_dict,
                                                 get_real_obs_resolution,
                                                 get_real_umi_obs_dict,
                                                 get_real_umi_action)
-from umi.real_world.spacemouse_shared_memory import Spacemouse
+# from umi.real_world.spacemouse_shared_memory import Spacemouse
+from umi.real_world.keyboard_spacemouse_shared_memory import KeyboardSpacemouse as Spacemouse
 from umi.common.pose_util import pose_to_mat, mat_to_pose
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
@@ -183,7 +184,7 @@ def main(input, output, robot_config,
                 init_joints=init_joints,
                 enable_multi_cam_vis=True,
                 # latency
-                camera_obs_latency=0.17,
+                camera_obs_latency=0.165,
                 # obs
                 camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
                 robot_obs_horizon=cfg.task.shape_meta.obs.robot0_eef_pos.horizon,
@@ -385,8 +386,8 @@ def main(input, output, robot_config,
                     # get teleop command
                     sm_state = sm.get_motion_state_transformed()
                     # print(sm_state)
-                    dpos = sm_state[:3] * (0.5 / frequency)
-                    drot_xyz = sm_state[3:] * (1.5 / frequency)
+                    dpos = sm_state[:3] * (0.1 / frequency)
+                    drot_xyz = sm_state[3:] * (0.3 / frequency)
 
                     drot = st.Rotation.from_euler('xyz', drot_xyz)
                     for robot_idx in control_robot_idx_list:

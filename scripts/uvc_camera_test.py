@@ -11,14 +11,15 @@ import cv2
 import time
 from multiprocessing.managers import SharedMemoryManager
 from umi.real_world.uvc_camera import UvcCamera
-from umi.common.usb_util import create_usb_list
+from umi.common.usb_util import create_usb_list, get_sorted_v4l_paths
 from umi.common.precise_sleep import precise_wait
 
 # %%
 def main():
     cv2.setNumThreads(1)
 
-    dev_video_path = '/dev/video0'
+    v4l_paths = get_sorted_v4l_paths()
+    dev_video_path = v4l_paths[0]  # change if you want to use a different camera
 
     # enumerate UBS device to find Elgato Capture Card
     device_list = create_usb_list()
@@ -38,6 +39,7 @@ def main():
             dev_video_path=dev_video_path,
             # dev_usb_path=dev_usb_path,
             resolution=(1920, 1080),
+            capture_fps=fps,
         ) as camera:
             print('Ready!')
             t_start = time.monotonic()

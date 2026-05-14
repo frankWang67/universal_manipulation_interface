@@ -57,3 +57,4 @@ dependencies:
     - PyExifTool==0.5
     - moviepy==1.0.3
     - zerorpc
+    - huggingface_hub==0.25.2

@@ -273,6 +273,7 @@ class UmiEnv:
         elif gripper_type == 'robotiq':
             gripper = RobotiqController(
                 shm_manager=shm_manager,
+                receive_latency=gripper_obs_latency,
             )
 
         self.camera = camera

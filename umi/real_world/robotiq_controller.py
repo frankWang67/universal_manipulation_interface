@@ -25,14 +25,16 @@ class RobotiqController(mp.Process):
             get_max_k=None,
             command_queue_size=1024,
             launch_timeout=3,
+            receive_latency=0.0,
             verbose=False
             ):
         super().__init__(name="RobotiqController", daemon=True)
-        self.gripper = RobotiqModBusGripper(width=0.085, port=port)
+        self.gripper = RobotiqModBusGripper(width=0.082, port=port)
         self.frequency = frequency
         self.move_max_speed = move_max_speed
         self.move_max_force = move_max_force
         self.launch_timeout = launch_timeout
+        self.receive_latency = receive_latency
         self.verbose = verbose
 
         self.gripper.activate()
@@ -156,12 +158,13 @@ class RobotiqController(mp.Process):
                 # 获取状态并存入 ring_buffer
                 # 注：频繁读取夹爪状态可能会降低控制频率
                 gripper_pos = gripper.get_position()
+                t_recv = time.time()
                 state = {
                     'gripper_position': gripper_pos,
                     'gripper_velocity': 0.0,
                     'gripper_force': 0.0,
-                    'gripper_receive_timestamp': time.time(),
-                    'gripper_timestamp': time.time()
+                    'gripper_receive_timestamp': t_recv,
+                    'gripper_timestamp': t_recv - self.receive_latency
                 }
                 self.ring_buffer.put(state)
 

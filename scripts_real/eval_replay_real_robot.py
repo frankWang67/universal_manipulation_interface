@@ -55,7 +55,8 @@ from umi.common.precise_sleep import precise_wait
 from umi.real_world.umi_env import UmiEnv
 from umi.real_world.real_inference_util import (get_real_obs_dict,
                                                 get_real_obs_resolution)
-from umi.real_world.spacemouse_shared_memory import Spacemouse
+# from umi.real_world.spacemouse_shared_memory import Spacemouse
+from umi.real_world.keyboard_spacemouse_shared_memory import KeyboardSpacemouse as Spacemouse
 from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, JpegXl
 register_codecs()
 
@@ -65,9 +66,7 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--input', '-i', required=True, help='Path to dataset')
 @click.option('--output', '-o', required=True, help='Directory to save recording')
 @click.option('--replay_episode', '-re', type=int, default=0)
-# @click.option('--robot_ip', '-ri', default='172.24.95.9')
-# @click.option('--gripper_ip', '-gi', default='172.24.95.17')
-@click.option('--robot_ip', default='172.24.95.8')
+@click.option('--robot_ip', default='192.168.50.220')
 @click.option('--gripper_ip', default='172.24.95.18')
 @click.option('--camera_reorder', '-cr', default='120')
 @click.option('--vis_camera_idx', default=0, type=int, help="Which RealSense camera to visualize.")
