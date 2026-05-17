@@ -237,3 +237,65 @@ def wait_until_still(env, velocity_threshold=0.01, timeout=5.0):
 
     print(f"[WARNING] Wait for still timed out! Vel: {tcp_vel:.3f}")
     return False
+
+def get_robot_cfg_name(robot_type: str) -> str:
+    robot_type = str(robot_type).lower()
+    robot_cfg_name_map = {
+        'ur5': 'ur5_robotiq_umi.yml',
+        'franka': 'panda_robotiq_umi.yml',
+    }
+    if robot_type not in robot_cfg_name_map:
+        raise KeyError(f"Unsupported robot_type for joint-space policy adaptation: {robot_type}")
+    return robot_cfg_name_map[robot_type]
+
+
+def robotiq_width_to_joint_angles(
+    gripper_width,
+    max_width: float = 0.085,
+    outer_knuckle_max: float = 0.81,
+    inner_knuckle_max: float = 0.8757,
+):
+    """
+    Convert parallel jaw opening width (meters) into the 6-D Robotiq joint state
+    expected by `ur5_robotiq_umi.yml`:
+    [left_outer_knuckle, left_inner_knuckle, left_inner_finger,
+     right_outer_knuckle, right_inner_knuckle, right_inner_finger].
+
+    The 2F-85 URDF uses one scalar closure state replicated across the finger
+    joints, with `inner_finger` rotating in the opposite direction.
+    """
+    width = np.asarray(gripper_width, dtype=np.float32)
+    width = np.clip(width, 0.0, max_width)
+    close_ratio = 1.0 - (width / max_width)
+
+    outer_knuckle = close_ratio * outer_knuckle_max
+    inner_knuckle = close_ratio * inner_knuckle_max
+    inner_finger = -inner_knuckle
+
+    return np.stack([
+        outer_knuckle,
+        inner_knuckle,
+        inner_finger,
+        outer_knuckle,
+        inner_knuckle,
+        inner_finger,
+    ], axis=-1).astype(np.float32)
+
+
+def build_policy_current_joint_angles(
+    arm_joint_angles,
+    gripper_width,
+    robot_cfg_name: str,
+):
+    arm_joint_angles = np.asarray(arm_joint_angles, dtype=np.float32)
+    if robot_cfg_name == 'ur5_robotiq_umi.yml':
+        gripper_joint_angles = robotiq_width_to_joint_angles(gripper_width)
+        return np.concatenate([arm_joint_angles, gripper_joint_angles], axis=-1)
+    return arm_joint_angles
+
+
+def get_current_action_base_pose(obs, robot_id: int = 0) -> np.ndarray:
+    return np.concatenate([
+        obs[f'robot{robot_id}_eef_pos'][-1],
+        obs[f'robot{robot_id}_eef_rot_axis_angle'][-1],
+    ], axis=-1).astype(np.float32)

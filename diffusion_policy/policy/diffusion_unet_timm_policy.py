@@ -83,7 +83,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
             local_cond=None,
             global_cond=None,
             generator=None,
-            episode_start_pose=None,
+            chunk_start_pose=None,
             obstacle_info=[],
             # keyword arguments to scheduler.step
             **kwargs
@@ -125,7 +125,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         obs_dict: Dict[str, torch.Tensor], 
         fixed_action_prefix: torch.Tensor=None, 
         env_batched=False,
-        episode_start_pose: torch.Tensor=None,
+        chunk_start_pose: torch.Tensor=None,
         obstacle_info=[],
         current_joint_angles=None,
     ) -> Dict[str, torch.Tensor]:
@@ -166,7 +166,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
             condition_mask=cond_mask,
             local_cond=None,
             global_cond=global_cond,
-            episode_start_pose=episode_start_pose,
+            chunk_start_pose=chunk_start_pose,
             obstacle_info=obstacle_info,
             **self.kwargs
         )

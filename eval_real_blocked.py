@@ -55,15 +55,116 @@ from umi.real_world.keystroke_counter import (
 from umi.real_world.real_inference_util import (get_real_obs_dict,
                                                 get_real_obs_resolution,
                                                 get_real_umi_obs_dict,
-                                                get_real_umi_action,
-                                                get_robot_cfg_name,
-                                                build_policy_current_joint_angles,
-                                                get_current_action_base_pose)
+                                                get_real_umi_action)
 # from umi.real_world.spacemouse_shared_memory import Spacemouse
 from umi.real_world.keyboard_spacemouse_shared_memory import KeyboardSpacemouse as Spacemouse
 from umi.common.pose_util import pose_to_mat, mat_to_pose
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def _get_robot_cfg_name(robot_type: str) -> str:
+    robot_type = str(robot_type).lower()
+    robot_cfg_name_map = {
+        'ur5': 'ur5_robotiq_umi.yml',
+        'franka': 'panda_robotiq_umi.yml',
+    }
+    if robot_type not in robot_cfg_name_map:
+        raise KeyError(f"Unsupported robot_type for joint-space policy adaptation: {robot_type}")
+    return robot_cfg_name_map[robot_type]
+
+
+def _robotiq_width_to_joint_angles(
+    gripper_width,
+    max_width: float = 0.085,
+    outer_knuckle_max: float = 0.81,
+    inner_knuckle_max: float = 0.8757,
+):
+    """
+    Convert parallel jaw opening width (meters) into the 6-D Robotiq joint state
+    expected by `ur5_robotiq_umi.yml`:
+    [left_outer_knuckle, left_inner_knuckle, left_inner_finger,
+     right_outer_knuckle, right_inner_knuckle, right_inner_finger].
+
+    The 2F-85 URDF uses one scalar closure state replicated across the finger
+    joints, with `inner_finger` rotating in the opposite direction.
+    """
+    width = np.asarray(gripper_width, dtype=np.float32)
+    width = np.clip(width, 0.0, max_width)
+    close_ratio = 1.0 - (width / max_width)
+
+    outer_knuckle = close_ratio * outer_knuckle_max
+    inner_knuckle = close_ratio * inner_knuckle_max
+    inner_finger = -inner_knuckle
+
+    return np.stack([
+        outer_knuckle,
+        inner_knuckle,
+        inner_finger,
+        outer_knuckle,
+        inner_knuckle,
+        inner_finger,
+    ], axis=-1).astype(np.float32)
+
+
+def _build_policy_current_joint_angles(
+    arm_joint_angles,
+    gripper_width,
+    robot_cfg_name: str,
+):
+    arm_joint_angles = np.asarray(arm_joint_angles, dtype=np.float32)
+    if robot_cfg_name == 'ur5_robotiq_umi.yml':
+        gripper_joint_angles = _robotiq_width_to_joint_angles(gripper_width)
+        return np.concatenate([arm_joint_angles, gripper_joint_angles], axis=-1)
+    return arm_joint_angles
+
+
+def _get_policy_current_joint_angles_from_env(
+    env,
+    obs,
+    robot_cfg_name: str,
+    source: str,
+):
+    aligned_joint_pos = np.asarray(obs['robot0_joint_pos'][-1], dtype=np.float32)
+    aligned_gripper_width = float(
+        np.asarray(obs['robot0_gripper_width'][-1]).squeeze()
+    )
+
+    latest_robot_state = env.get_robot_state()[0]
+    latest_gripper_state = env.get_gripper_state()[0]
+    latest_joint_pos = np.asarray(latest_robot_state['ActualQ'], dtype=np.float32)
+    target_joint_pos = np.asarray(latest_robot_state['TargetQ'], dtype=np.float32)
+    latest_gripper_width = float(latest_gripper_state['gripper_position'])
+
+    if source == 'latest_actual':
+        seed_joint_pos = latest_joint_pos
+        seed_gripper_width = latest_gripper_width
+    elif source == 'aligned_obs':
+        seed_joint_pos = aligned_joint_pos
+        seed_gripper_width = aligned_gripper_width
+    else:
+        raise ValueError(f"Unknown joint seed source: {source}")
+
+    current_joint_angles_np = _build_policy_current_joint_angles(
+        arm_joint_angles=seed_joint_pos,
+        gripper_width=seed_gripper_width,
+        robot_cfg_name=robot_cfg_name,
+    )
+    debug = {
+        'aligned_joint_pos': aligned_joint_pos,
+        'latest_joint_pos': latest_joint_pos,
+        'target_joint_pos': target_joint_pos,
+        'aligned_gripper_width': aligned_gripper_width,
+        'latest_gripper_width': latest_gripper_width,
+    }
+    return current_joint_angles_np, debug
+
+
+def _get_current_action_base_pose(obs, robot_id: int = 0) -> np.ndarray:
+    return np.concatenate([
+        obs[f'robot{robot_id}_eef_pos'][-1],
+        obs[f'robot{robot_id}_eef_rot_axis_angle'][-1],
+    ], axis=-1).astype(np.float32)
 
 def solve_table_collision(ee_pose, gripper_width, height_threshold):
     finger_thickness = 25.5 / 1000
@@ -143,6 +244,13 @@ def solve_sphere_collision(ee_poses, robots_config):
 @click.option('--guidance_apply_last_step_only', is_flag=True, help="Apply joint-space guidance only at the final denoising step.")
 @click.option('--ik_refine_last_step', is_flag=True, help="Run a cuRobo IK projection at the last denoising step for joint-space policies.")
 @click.option('--cartesian_delta_mode', default='geometric', type=click.Choice(['geometric', 'se3_delta']), help="Pose residual used by joint-space policies.")
+@click.option('--max_joint_speed', default=0.6, type=float, help="Joint-space waypoint speed limit in rad/s.")
+@click.option('--blocked_action_lead_time', default=0.25, type=float, help="Lead time before the first blocking chunk waypoint, after latency compensation, in seconds.")
+@click.option('--blocked_settle_time', default=0.5, type=float, help="How long robot/gripper velocities must stay low before taking the next observation.")
+@click.option('--blocked_joint_vel_threshold', default=0.01, type=float, help="Joint velocity threshold in rad/s used to decide the robot is static.")
+@click.option('--blocked_gripper_vel_threshold', default=0.002, type=float, help="Gripper velocity threshold in m/s used to decide the gripper is static.")
+@click.option('--joint_seed_source', default='latest_actual', type=click.Choice(['latest_actual', 'aligned_obs']), help="Joint state used as current_joint_angles for joint-space policy inference.")
+@click.option('--blocked_action_start_idx', default=0, type=int, help="Drop this many leading actions from each blocking chunk before execution.")
 def main(input, output, robot_config, 
     match_dataset, match_episode, match_camera,
     camera_reorder,
@@ -156,7 +264,10 @@ def main(input, output, robot_config,
     guidance_sdf_softmax_temp, guidance_sdf_topk,
     guidance_task_pos_weight, guidance_task_rot_weight,
     guidance_use_clean_sample, guidance_apply_last_step_only,
-    ik_refine_last_step, cartesian_delta_mode):
+    ik_refine_last_step, cartesian_delta_mode, max_joint_speed,
+    blocked_action_lead_time, blocked_settle_time,
+    blocked_joint_vel_threshold, blocked_gripper_vel_threshold,
+    joint_seed_source, blocked_action_start_idx):
     max_gripper_width = 0.09
     gripper_speed = 0.2
     
@@ -193,7 +304,7 @@ def main(input, output, robot_config,
             raise NotImplementedError(
                 "Joint-space real-world evaluation is currently implemented for the UR RTDE controller path, not Franka."
             )
-        robot_cfg_name = get_robot_cfg_name(robots_config[0]['robot_type'])
+        robot_cfg_name = _get_robot_cfg_name(robots_config[0]['robot_type'])
         if joint_space_guidance:
             cfg.policy._target_ = (
                 'diffusion_policy.policy.diffusion_unet_timm_policy_joint_space_with_guidance.'
@@ -224,6 +335,7 @@ def main(input, output, robot_config,
                 cfg.policy.guidance_apply_last_step_only = guidance_apply_last_step_only
     print("model_name:", cfg.policy.obs_encoder.model_name)
     print("dataset_path:", cfg.task.dataset.dataset_path)
+    print("obs_keys:", list(cfg.task.shape_meta.obs.keys()))
 
     # setup experiment
     dt = 1/frequency
@@ -256,7 +368,7 @@ def main(input, output, robot_config,
                 init_joints=init_joints,
                 enable_multi_cam_vis=True,
                 # latency
-                camera_obs_latency=0.155,
+                camera_obs_latency=0.165,
                 # obs
                 camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
                 robot_obs_horizon=cfg.task.shape_meta.obs.robot0_eef_pos.horizon,
@@ -267,7 +379,7 @@ def main(input, output, robot_config,
                 # action
                 max_pos_speed=2.0,
                 max_rot_speed=6.0,
-                max_joint_speed=0.6,
+                max_joint_speed=max_joint_speed,
                 shm_manager=shm_manager) as env:
             cv2.setNumThreads(2)
             print("Waiting for camera")
@@ -336,19 +448,19 @@ def main(input, output, robot_config,
                     lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                 current_joint_angles = None
                 if joint_space or joint_space_guidance:
-                    aligned_joint_pos = obs['robot0_joint_pos'][-1]
-                    current_gripper_width = float(np.asarray(obs['robot0_gripper_width'][-1]).squeeze())
+                    current_joint_angles_np, _ = _get_policy_current_joint_angles_from_env(
+                        env=env,
+                        obs=obs,
+                        robot_cfg_name=robot_cfg_name,
+                        source=joint_seed_source,
+                    )
                     current_joint_angles = torch.from_numpy(
-                        build_policy_current_joint_angles(
-                            arm_joint_angles=aligned_joint_pos,
-                            gripper_width=current_gripper_width,
-                            robot_cfg_name=robot_cfg_name,
-                        )
+                        current_joint_angles_np
                     ).unsqueeze(0).to(device)
                 result = policy.predict_action(
                     obs_dict,
                     chunk_start_pose=torch.from_numpy(
-                        get_current_action_base_pose(obs, robot_id=0)
+                        _get_current_action_base_pose(obs, robot_id=0)
                     ).unsqueeze(0).to(device) if (joint_space or joint_space_guidance) else None,
                     current_joint_angles=current_joint_angles,
                 )
@@ -552,10 +664,8 @@ def main(input, output, robot_config,
                     print("Started!")
                     iter_idx = 0
                     perv_target_pose = None
+                    prev_joint_action_end = None
                     while True:
-                        # calculate timing
-                        t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
-
                         # get obs
                         obs = env.get_obs()
                         obs_timestamps = obs['timestamp']
@@ -572,36 +682,79 @@ def main(input, output, robot_config,
                             obs_dict = dict_apply(obs_dict_np, 
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             current_joint_angles = None
+                            joint_seed_debug = None
                             if joint_space or joint_space_guidance:
-                                aligned_joint_pos = obs['robot0_joint_pos'][-1]
-                                current_gripper_width = float(np.asarray(obs['robot0_gripper_width'][-1]).squeeze())
+                                action_base_pose = _get_current_action_base_pose(obs, robot_id=0)
+                                current_joint_angles_np, joint_seed_debug = _get_policy_current_joint_angles_from_env(
+                                    env=env,
+                                    obs=obs,
+                                    robot_cfg_name=robot_cfg_name,
+                                    source=joint_seed_source,
+                                )
                                 current_joint_angles = torch.from_numpy(
-                                    build_policy_current_joint_angles(
-                                        arm_joint_angles=aligned_joint_pos,
-                                        gripper_width=current_gripper_width,
-                                        robot_cfg_name=robot_cfg_name,
-                                    )
+                                    current_joint_angles_np
                                 ).unsqueeze(0).to(device)
                             result = policy.predict_action(
                                 obs_dict,
                                 chunk_start_pose=torch.from_numpy(
-                                    get_current_action_base_pose(obs, robot_id=0)
+                                    action_base_pose
                                 ).unsqueeze(0).to(device) if (joint_space or joint_space_guidance) else None,
                                 current_joint_angles=current_joint_angles,
                             )
                             if joint_space or joint_space_guidance:
                                 action = result['joint_action_pred'][0].detach().to('cpu').numpy()
+                                action_base_delta = action_base_pose - np.asarray(episode_start_pose[0], dtype=np.float32)
+                                prev_end_msg = "prev_chunk=none"
+                                if prev_joint_action_end is not None:
+                                    first_delta = action[0, :6] - prev_joint_action_end
+                                    last_delta = action[-1, :6] - prev_joint_action_end
+                                    prev_end_msg = (
+                                        f"new_first_vs_prev_end_norm={np.linalg.norm(first_delta):.6f}rad, "
+                                        f"new_first_vs_prev_end_max={np.max(np.abs(first_delta)):.6f}rad, "
+                                        f"new_last_vs_prev_end_norm={np.linalg.norm(last_delta):.6f}rad"
+                                    )
+                                print(
+                                    "[JOINT OBS DEBUG] "
+                                    f"seed_source={joint_seed_source}, "
+                                    f"aligned_vs_actual_norm={np.linalg.norm(joint_seed_debug['aligned_joint_pos'] - joint_seed_debug['latest_joint_pos']):.6f}rad, "
+                                    f"aligned_vs_actual_max={np.max(np.abs(joint_seed_debug['aligned_joint_pos'] - joint_seed_debug['latest_joint_pos'])):.6f}rad, "
+                                    f"target_vs_actual_norm={np.linalg.norm(joint_seed_debug['target_joint_pos'] - joint_seed_debug['latest_joint_pos']):.6f}rad, "
+                                    f"action_base_vs_episode_start_norm={np.linalg.norm(action_base_delta):.6f}, "
+                                    f"new_first_vs_seed_norm={np.linalg.norm(action[0, :6] - current_joint_angles_np[:6]):.6f}rad, "
+                                    f"new_last_vs_seed_norm={np.linalg.norm(action[-1, :6] - current_joint_angles_np[:6]):.6f}rad, "
+                                    f"{prev_end_msg}"
+                                )
                             else:
                                 raw_action = result['action_pred'][0].detach().to('cpu').numpy()
                                 action = get_real_umi_action(raw_action, obs, action_pose_repr)
-                            action[..., -1] -= 0.005 # gripper width offset for better performance
                             print('Inference latency:', time.time() - s)
                         
                         # convert policy action to env actions
                         this_target_poses = action
                         action_mode = 'eef'
+                        if blocked_action_start_idx > 0:
+                            if blocked_action_start_idx >= len(this_target_poses):
+                                raise ValueError(
+                                    f"blocked_action_start_idx={blocked_action_start_idx} "
+                                    f"must be smaller than chunk length={len(this_target_poses)}."
+                                )
+                            this_target_poses = this_target_poses[blocked_action_start_idx:]
+                            print(
+                                f"Blocking debug dropped leading {blocked_action_start_idx} "
+                                f"actions; executing {len(this_target_poses)} actions."
+                            )
                         if joint_space or joint_space_guidance:
                             action_mode = 'joint'
+                            if prev_joint_action_end is not None:
+                                exec_first_delta = (
+                                    this_target_poses[0, :6] - prev_joint_action_end
+                                )
+                                print(
+                                    "[JOINT EXEC DEBUG] "
+                                    f"exec_first_idx={blocked_action_start_idx}, "
+                                    f"exec_first_vs_prev_end_norm={np.linalg.norm(exec_first_delta):.6f}rad, "
+                                    f"exec_first_vs_prev_end_max={np.max(np.abs(exec_first_delta)):.6f}rad"
+                                )
                         else:
                             assert this_target_poses.shape[1] == len(robots_config) * 7
                             for target_pose in this_target_poses:
@@ -618,25 +771,30 @@ def main(input, output, robot_config,
                                     robots_config=robots_config
                                 )
 
-                        # deal with timing
-                        # the same step actions are always the target for
-                        action_timestamps = (np.arange(len(action), dtype=np.float64)
-                            ) * dt + obs_timestamps[-1]
-                        print(dt)
-                        action_exec_latency = 0.01
-                        curr_time = time.time()
-                        is_new = action_timestamps > (curr_time + action_exec_latency)
-                        if np.sum(is_new) == 0:
-                            # exceeded time budget, still do something
-                            this_target_poses = this_target_poses[[-1]]
-                            # schedule on next available step
-                            next_step_idx = int(np.ceil((curr_time - eval_t_start) / dt))
-                            action_timestamp = eval_t_start + (next_step_idx) * dt
-                            print('Over budget', action_timestamp - curr_time)
-                            action_timestamps = np.array([action_timestamp])
-                        else:
-                            this_target_poses = this_target_poses[is_new]
-                            action_timestamps = action_timestamps[is_new]
+                        # In this blocked debug variant, do not align execution
+                        # timestamps to the stale observation time. Re-time the
+                        # whole chunk from "now", execute it, wait until it is
+                        # finished and settled, then take the next observation.
+                        max_robot_action_latency = max(
+                            rc['robot_action_latency'] for rc in robots_config
+                        )
+                        max_gripper_action_latency = max(
+                            gc['gripper_action_latency'] for gc in grippers_config
+                        )
+                        max_action_latency = max(
+                            max_robot_action_latency,
+                            max_gripper_action_latency
+                        )
+                        action_start_time = (
+                            time.time()
+                            + max_action_latency
+                            + blocked_action_lead_time
+                        )
+                        action_timestamps = (
+                            np.arange(len(this_target_poses), dtype=np.float64) * dt
+                            + action_start_time
+                        )
+                        nominal_chunk_end_time = action_timestamps[-1]
 
                         # execute actions
                         env.exec_actions(
@@ -645,6 +803,8 @@ def main(input, output, robot_config,
                             compensate_latency=True,
                             action_mode=action_mode
                         )
+                        if joint_space or joint_space_guidance:
+                            prev_joint_action_end = np.asarray(this_target_poses[-1, :6]).copy()
                         print(f"Submitted {len(this_target_poses)} steps of actions.")
 
                         # visualize
@@ -684,8 +844,57 @@ def main(input, output, robot_config,
                             env.end_episode()
                             break
 
-                        # wait for execution
-                        precise_wait(t_cycle_end - frame_latency)
+                        # Wait for execution to finish and settle before the
+                        # next observation/inference cycle. This is velocity-
+                        # based because the joint controller can internally
+                        # extend timing when max_joint_speed is active.
+                        static_since = None
+                        while True:
+                            _ = cv2.pollKey()
+                            press_events = key_counter.get_press_events()
+                            for key_stroke in press_events:
+                                if key_stroke == KeyCode(char='s'):
+                                    print('Stopped.')
+                                    stop_episode = True
+                                elif key_stroke == KeyCode(char='q'):
+                                    env.end_episode()
+                                    exit(0)
+                            if stop_episode:
+                                break
+
+                            robot_states = env.get_robot_state()
+                            max_joint_vel = max(
+                                np.max(np.abs(np.asarray(rs['ActualQd'])))
+                                for rs in robot_states
+                            )
+                            gripper_states = env.get_gripper_state()
+                            max_gripper_vel = max(
+                                abs(float(gs.get('gripper_velocity', 0.0)))
+                                for gs in gripper_states
+                            )
+                            now = time.time()
+                            is_static = (
+                                (now >= nominal_chunk_end_time)
+                                and (max_joint_vel <= blocked_joint_vel_threshold)
+                                and (max_gripper_vel <= blocked_gripper_vel_threshold)
+                            )
+                            if is_static:
+                                if static_since is None:
+                                    static_since = now
+                                elif now - static_since >= blocked_settle_time:
+                                    print(
+                                        "Blocking chunk settled: "
+                                        f"max_joint_vel={max_joint_vel:.6f}rad/s, "
+                                        f"max_gripper_vel={max_gripper_vel:.6f}m/s"
+                                    )
+                                    break
+                            else:
+                                static_since = None
+                            precise_wait(now + 0.05, time_func=time.time)
+                        if stop_episode:
+                            env.end_episode()
+                            break
+
                         iter_idx += steps_per_inference
 
                 except KeyboardInterrupt:

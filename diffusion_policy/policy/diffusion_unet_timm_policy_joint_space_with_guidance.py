@@ -4,16 +4,11 @@ import time
 
 import torch
 import torch.nn.functional as F
-import pytorch_kinematics as pk
 
-from curobo.types.base import TensorDeviceType
-from curobo.types.robot import RobotConfig
-from curobo.types.math import Pose
-from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 from curobo.geom.sdf.world import CollisionQueryBuffer, WorldCollisionConfig
 from curobo.geom.sdf.utils import create_collision_checker
 from curobo.geom.types import WorldConfig, Cuboid
-from curobo.util_file import get_robot_configs_path, get_assets_path, join_path, load_yaml
+from curobo.util_file import get_robot_configs_path
 
 from diffusion_policy.common.pytorch_util import dict_apply
 
@@ -27,7 +22,7 @@ from diffusion_policy.common.guided_diffusion_util import (
 )
 from diffusion_policy.policy.diffusion_unet_timm_policy_joint_space import DiffusionUnetTimmPolicyJointSpace
 
-from mani_skill.utils.geometry.rotation_conversions import (
+from diffusion_policy.common.rotation_conversions import (
     axis_angle_to_matrix,
     matrix_to_axis_angle,
     matrix_to_rotation_6d as matrix_to_rot6d,
@@ -79,7 +74,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             *args,
             robot_cfg_name=robot_cfg_name,
             robot_urdf_path=robot_urdf_path,
-            ee_link_name=ee_link_name if ee_link_name is not None else "eef",
+            ee_link_name=ee_link_name,
             arm_dof=arm_dof,
             **kwargs,
         )
@@ -153,54 +148,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         raise ValueError(f"Cannot infer cuRobo robot config for robot_uid={robot_uid}")
 
     def _ensure_kinematics(self, device: torch.device):
-        if self._ik_solver is not None:
-            return
-
-        self._tensor_args = TensorDeviceType(device=device)
-        robot_cfg_dict = load_yaml(join_path(get_robot_configs_path(), self.robot_cfg_name))["robot_cfg"]
-
-        kin_cfg = robot_cfg_dict.get("kinematics", {})
-        if self.ee_link_name is None:
-            self.ee_link_name = kin_cfg.get("ee_link", "eef")
-
-        if self.robot_urdf_path is None:
-            urdf_rel = kin_cfg.get("urdf_path")
-            if urdf_rel is None:
-                raise ValueError(f"urdf_path missing in robot config {self.robot_cfg_name}")
-            self.robot_urdf_path = join_path(get_assets_path(), urdf_rel)
-
-        robot_cfg = RobotConfig.from_dict(robot_cfg_dict, self._tensor_args)
-
-        ik_config = IKSolverConfig.load_from_robot_config(
-            robot_cfg,
-            None,
-            rotation_threshold=self.ik_rotation_threshold,
-            position_threshold=self.ik_position_threshold,
-            num_seeds=self.ik_num_seeds,
-            self_collision_check=False,
-            self_collision_opt=False,
-            tensor_args=self._tensor_args,
-            use_cuda_graph=False,
-        )
-        self._ik_solver = IKSolver(ik_config)
-        self._kin_model = self._ik_solver.kinematics
-        self._robot_dof = int(self._kin_model.get_dof())
-
-        with open(self.robot_urdf_path, "r") as f:
-            urdf_str = f.read()
-        try:
-            self._pk_chain = pk.build_serial_chain_from_urdf(urdf_str, self.ee_link_name)
-        except ValueError:
-            self._pk_chain = pk.build_serial_chain_from_urdf(
-                urdf_str.encode("utf-8"), self.ee_link_name
-            )
-        self._pk_chain = self._pk_chain.to(dtype=torch.float32, device=device)
-
-        if self.arm_dof <= 0:
-            self.arm_dof = int(self._pk_chain.n_joints)
-
-        # One-time torch.compile of hot-path functions (including CBF QP).
-        DiffusionUnetTimmPolicyJointSpace._compile_hot_functions(self, device)
+        super()._ensure_kinematics(device)
         self._compile_cbf_functions(device)
 
     def _compile_cbf_functions(self, device: torch.device):
@@ -576,7 +524,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         self,
         q_arm_ref: torch.Tensor,
         cart_phys_clean: torch.Tensor,
-        episode_start_pose: torch.Tensor,
+        chunk_start_pose: torch.Tensor,
     ) -> torch.Tensor:
         """
         Approximate clean joint sample using one Jacobian linearization step.
@@ -591,7 +539,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
 
         # target absolute pose from predicted clean Cartesian sample
         abs_pos_clean, abs_rot_clean = self._relative_pose9_to_absolute(
-            cart_phys_clean[..., :9], episode_start_pose
+            cart_phys_clean[..., :9], chunk_start_pose
         )
         abs_rot6d_clean = matrix_to_rot6d(abs_rot_clean.reshape(-1, 3, 3)).reshape(bsz, horizon, 6)
         abs_pose9_clean = torch.cat([abs_pos_clean, abs_rot6d_clean], dim=-1)
@@ -613,14 +561,14 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         local_cond=None,
         global_cond=None,
         generator=None,
-        episode_start_pose: Optional[torch.Tensor] = None,
+        chunk_start_pose: Optional[torch.Tensor] = None,
         obstacle_info=None,
         current_joint_angles: Optional[torch.Tensor] = None,
         return_debug: bool = False,
         **kwargs,
     ):
-        if episode_start_pose is None:
-            raise ValueError("episode_start_pose is required for joint-space inference.")
+        if chunk_start_pose is None:
+            raise ValueError("chunk_start_pose is required for joint-space inference.")
 
         self._ensure_kinematics(condition_data.device)
         self._build_world_collision(
@@ -630,8 +578,8 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         )
 
         # Pre-compute base coordinate frame (constant across denoising steps).
-        base_pos = episode_start_pose[:, :3]
-        base_rot = axis_angle_to_matrix(episode_start_pose[:, 3:6])
+        base_pos = chunk_start_pose[:, :3]
+        base_rot = axis_angle_to_matrix(chunk_start_pose[:, 3:6])
         base_rot_t = base_rot.transpose(-2, -1)
 
         model = self.model
@@ -646,7 +594,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         }
 
         if current_joint_angles is None:
-            q_start = self._solve_start_joint_from_pose(episode_start_pose)
+            q_start = self._solve_start_joint_from_pose(chunk_start_pose)
         else:
             q_start = current_joint_angles[..., : self._robot_dof].to(
                 device=condition_data.device, dtype=condition_data.dtype
@@ -821,7 +769,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
                     q_guidance_state = self._estimate_clean_joint_from_cartesian(
                         q_arm_ref=q_arm_new,
                         cart_phys_clean=cart_phys_clean,
-                        episode_start_pose=episode_start_pose,
+                        chunk_start_pose=chunk_start_pose,
                     )
                 else:
                     q_guidance_state = q_arm_new
@@ -926,14 +874,14 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
 
                 if return_debug and self.guidance_use_clean_sample:
                     abs_p_before, abs_r_before = self._fk_to_absolute(q_before_guidance)
-                    rel9_before = self._absolute_pose_to_relative9(abs_p_before, abs_r_before, episode_start_pose)
+                    rel9_before = self._absolute_pose_to_relative9(abs_p_before, abs_r_before, chunk_start_pose)
                     cart_before = torch.cat([rel9_before, cart_phys_prev_tgt[..., 9:10]], dim=-1)
                     err_before = torch.linalg.norm(
                         (cart_before[..., :9] - cart_phys_clean[..., :9]).reshape(bsz, -1), dim=-1
                     )
 
                     abs_p_after, abs_r_after = self._fk_to_absolute(q_arm_new)
-                    rel9_after = self._absolute_pose_to_relative9(abs_p_after, abs_r_after, episode_start_pose)
+                    rel9_after = self._absolute_pose_to_relative9(abs_p_after, abs_r_after, chunk_start_pose)
                     cart_after = torch.cat([rel9_after, cart_phys_prev_tgt[..., 9:10]], dim=-1)
                     err_after = torch.linalg.norm(
                         (cart_after[..., :9] - cart_phys_clean[..., :9]).reshape(bsz, -1), dim=-1
@@ -946,7 +894,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             if return_debug:
                 q_arm_dbg = q_traj[..., : self._robot_dof]
                 abs_p, abs_r = self._fk_to_absolute(q_arm_dbg)
-                rel9 = self._absolute_pose_to_relative9(abs_p, abs_r, episode_start_pose)
+                rel9 = self._absolute_pose_to_relative9(abs_p, abs_r, chunk_start_pose)
                 cart_phys_after = torch.cat(
                     [rel9, q_traj[..., self._robot_dof : self._robot_dof + 1]], dim=-1
                 )
@@ -985,7 +933,7 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         obs_dict: Dict[str, torch.Tensor],
         fixed_action_prefix: torch.Tensor = None,
         env_batched=False,
-        episode_start_pose: torch.Tensor = None,
+        chunk_start_pose: torch.Tensor = None,
         obstacle_info=None,
         current_joint_angles: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -1019,15 +967,15 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
             cond_mask[:, :n_fixed_steps] = True
             cond_data = self.normalizer["action"].normalize(cond_data)
 
-        if episode_start_pose is None:
-            raise ValueError("episode_start_pose must be provided for joint-space policy inference.")
+        if chunk_start_pose is None:
+            raise ValueError("chunk_start_pose must be provided for joint-space policy inference.")
 
         nsample = self.conditional_sample(
             condition_data=cond_data,
             condition_mask=cond_mask,
             local_cond=None,
             global_cond=global_cond,
-            episode_start_pose=episode_start_pose,
+            chunk_start_pose=chunk_start_pose,
             obstacle_info=obstacle_info,
             current_joint_angles=current_joint_angles,
             **self.kwargs,

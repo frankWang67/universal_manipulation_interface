@@ -1,5 +1,5 @@
 import torch
-from mani_skill.utils.geometry.rotation_conversions import axis_angle_to_matrix
+from diffusion_policy.common.rotation_conversions import axis_angle_to_matrix
 
 def quat_conjugate(quat):
     """

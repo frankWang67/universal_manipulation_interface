@@ -12,12 +12,14 @@ from umi.shared_memory.shared_memory_queue import (
     SharedMemoryQueue, Empty)
 from umi.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from umi.common.pose_trajectory_interpolator import PoseTrajectoryInterpolator
+from umi.common.joint_trajectory_interpolator import JointTrajectoryInterpolator
 from diffusion_policy.common.precise_sleep import precise_wait
 
 class Command(enum.Enum):
     STOP = 0
     SERVOL = 1
     SCHEDULE_WAYPOINT = 2
+    SCHEDULE_JOINT_WAYPOINT = 3
 
 
 class RTDEInterpolationController(mp.Process):
@@ -35,6 +37,7 @@ class RTDEInterpolationController(mp.Process):
             gain=300,
             max_pos_speed=0.25, # 5% of max speed
             max_rot_speed=0.16, # 5% of max speed
+            max_joint_speed=0.6,
             launch_timeout=3,
             tcp_offset_pose=None,
             payload_mass=None,
@@ -53,6 +56,7 @@ class RTDEInterpolationController(mp.Process):
         gain: [100, 2000] proportional gain for following target position
         max_pos_speed: m/s
         max_rot_speed: rad/s
+        max_joint_speed: rad/s
         tcp_offset_pose: 6d pose
         payload_mass: float
         payload_cog: 3d position, center of gravity
@@ -66,6 +70,7 @@ class RTDEInterpolationController(mp.Process):
         assert 100 <= gain <= 2000
         assert 0 < max_pos_speed
         assert 0 < max_rot_speed
+        assert 0 < max_joint_speed
         if tcp_offset_pose is not None:
             tcp_offset_pose = np.array(tcp_offset_pose)
             assert tcp_offset_pose.shape == (6,)
@@ -86,6 +91,7 @@ class RTDEInterpolationController(mp.Process):
         self.gain = gain
         self.max_pos_speed = max_pos_speed
         self.max_rot_speed = max_rot_speed
+        self.max_joint_speed = max_joint_speed
         self.launch_timeout = launch_timeout
         self.tcp_offset_pose = tcp_offset_pose
         self.payload_mass = payload_mass
@@ -103,6 +109,7 @@ class RTDEInterpolationController(mp.Process):
         example = {
             'cmd': Command.SERVOL.value,
             'target_pose': np.zeros((6,), dtype=np.float64),
+            'target_joints': np.zeros((6,), dtype=np.float64),
             'duration': 0.0,
             'target_time': 0.0
         }
@@ -207,6 +214,17 @@ class RTDEInterpolationController(mp.Process):
         }
         self.input_queue.put(message)
 
+    def schedule_joint_waypoint(self, joints, target_time):
+        joints = np.array(joints)
+        assert joints.shape == (6,)
+
+        message = {
+            'cmd': Command.SCHEDULE_JOINT_WAYPOINT.value,
+            'target_joints': joints,
+            'target_time': target_time
+        }
+        self.input_queue.put(message)
+
     # ========= receive APIs =============
     def get_state(self, k=None, out=None):
         if k is None:
@@ -249,6 +267,7 @@ class RTDEInterpolationController(mp.Process):
             # main loop
             dt = 1. / self.frequency
             curr_pose = rtde_r.getActualTCPPose()
+            curr_joints = rtde_r.getActualQ()
             # use monotonic time to make sure the control loop never go backward
             curr_t = time.monotonic()
             last_waypoint_time = curr_t
@@ -256,6 +275,11 @@ class RTDEInterpolationController(mp.Process):
                 times=[curr_t],
                 poses=[curr_pose]
             )
+            joint_interp = JointTrajectoryInterpolator(
+                times=[curr_t],
+                joints=[curr_joints]
+            )
+            use_joint_control = False
             
             t_start = time.monotonic()
             iter_idx = 0
@@ -269,14 +293,25 @@ class RTDEInterpolationController(mp.Process):
                 # diff = t_now - pose_interp.times[-1]
                 # if diff > 0:
                 #     print('extrapolate', diff)
-                pose_command = pose_interp(t_now)
                 vel = 0.5
                 acc = 0.5
-                assert rtde_c.servoL(pose_command, 
-                    vel, acc, # dummy, not used by ur5
-                    dt, 
-                    self.lookahead_time, 
-                    self.gain)
+                if use_joint_control:
+                    joint_command = joint_interp(t_now)
+                    assert rtde_c.servoJ(
+                        joint_command,
+                        vel,
+                        acc,
+                        dt,
+                        self.lookahead_time,
+                        self.gain
+                    )
+                else:
+                    pose_command = pose_interp(t_now)
+                    assert rtde_c.servoL(pose_command, 
+                        vel, acc, # dummy, not used by ur5
+                        dt, 
+                        self.lookahead_time, 
+                        self.gain)
                 
                 # update robot state
                 state = dict()
@@ -343,6 +378,28 @@ class RTDEInterpolationController(mp.Process):
                             last_waypoint_time=last_waypoint_time
                         )
                         last_waypoint_time = target_time
+                        use_joint_control = False
+                    elif cmd == Command.SCHEDULE_JOINT_WAYPOINT.value:
+                        target_joints = command['target_joints']
+                        target_time = float(command['target_time'])
+                        target_time = time.monotonic() - time.time() + target_time
+                        curr_time = t_now + dt
+                        if not use_joint_control:
+                            current_joints = rtde_r.getActualQ()
+                            joint_interp = JointTrajectoryInterpolator(
+                                times=[curr_time],
+                                joints=[current_joints]
+                            )
+                            last_waypoint_time = curr_time
+                        joint_interp = joint_interp.schedule_waypoint(
+                            joints=target_joints,
+                            time=target_time,
+                            max_joint_speed=self.max_joint_speed,
+                            curr_time=curr_time,
+                            last_waypoint_time=last_waypoint_time
+                        )
+                        last_waypoint_time = joint_interp.times[-1]
+                        use_joint_control = True
                     else:
                         keep_running = False
                         break

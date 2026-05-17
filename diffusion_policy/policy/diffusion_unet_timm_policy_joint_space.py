@@ -7,7 +7,7 @@ from curobo.types.base import TensorDeviceType
 from curobo.types.robot import RobotConfig
 from curobo.types.math import Pose
 from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
-from curobo.util_file import get_robot_configs_path, join_path, load_yaml
+from curobo.util_file import get_assets_path, get_robot_configs_path, join_path, load_yaml
 
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.policy.diffusion_unet_timm_policy import DiffusionUnetTimmPolicy
@@ -18,7 +18,7 @@ from diffusion_policy.policy.diffusion_unet_timm_policy import DiffusionUnetTimm
 # torch.compile and has no impact on eager execution or numerical results.
 torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
-from mani_skill.utils.geometry.rotation_conversions import (
+from diffusion_policy.common.rotation_conversions import (
     axis_angle_to_matrix,
     matrix_to_axis_angle,
     matrix_to_quaternion,
@@ -55,9 +55,9 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         self,
         *args,
         robot_cfg_name: str = "panda_robotiq_wristcam.yml",
-        robot_urdf_path: str = "/home/wshf/curobo/src/curobo/content/assets/robot/robotiq_gripper_robots/panda/panda_robotiq_wristcam.urdf",
-        ee_link_name: str = "eef",
-        arm_dof: int = 7,
+        robot_urdf_path: Optional[str] = None,
+        ee_link_name: Optional[str] = None,
+        arm_dof: int = -1,
         ik_num_seeds: int = 20,
         jacobian_damping: float = 0.001,
         ik_refine_each_step: bool = False,
@@ -98,6 +98,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         self._kin_model = None
         self._pk_chain = None
         self._robot_dof = None
+        self._tensor_args = None
         self._last_joint_traj = None
 
     def _joint_traj_to_env_action(self, q_traj: torch.Tensor) -> torch.Tensor:
@@ -179,9 +180,18 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         if self._ik_solver is not None:
             return
 
-        tensor_args = TensorDeviceType(device=device)
+        self._tensor_args = TensorDeviceType(device=device)
         robot_cfg_dict = load_yaml(join_path(get_robot_configs_path(), self.robot_cfg_name))["robot_cfg"]
-        robot_cfg = RobotConfig.from_dict(robot_cfg_dict, tensor_args)
+        kin_cfg = robot_cfg_dict.get("kinematics", {})
+        if self.ee_link_name is None:
+            self.ee_link_name = kin_cfg.get("ee_link", "eef")
+        if self.robot_urdf_path is None:
+            urdf_rel = kin_cfg.get("urdf_path")
+            if urdf_rel is None:
+                raise ValueError(f"urdf_path missing in robot config {self.robot_cfg_name}")
+            self.robot_urdf_path = join_path(get_assets_path(), urdf_rel)
+
+        robot_cfg = RobotConfig.from_dict(robot_cfg_dict, self._tensor_args)
 
         ik_config = IKSolverConfig.load_from_robot_config(
             robot_cfg,
@@ -191,22 +201,27 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
             num_seeds=self.ik_num_seeds,
             self_collision_check=False,
             self_collision_opt=False,
-            tensor_args=tensor_args,
+            tensor_args=self._tensor_args,
             use_cuda_graph=False,
         )
         self._ik_solver = IKSolver(ik_config)
         self._kin_model = self._ik_solver.kinematics
         self._robot_dof = int(self._kin_model.get_dof())
+        pk_root_link_name = kin_cfg.get("base_link", "")
 
         with open(self.robot_urdf_path, "r") as f:
             urdf_str = f.read()
         try:
-            self._pk_chain = pk.build_serial_chain_from_urdf(urdf_str, self.ee_link_name)
+            self._pk_chain = pk.build_serial_chain_from_urdf(
+                urdf_str, self.ee_link_name, root_link_name=pk_root_link_name
+            )
         except ValueError:
             self._pk_chain = pk.build_serial_chain_from_urdf(
-                urdf_str.encode("utf-8"), self.ee_link_name
+                urdf_str.encode("utf-8"), self.ee_link_name, root_link_name=pk_root_link_name
             )
         self._pk_chain = self._pk_chain.to(dtype=torch.float32, device=device)
+        if self.arm_dof <= 0:
+            self.arm_dof = int(self._pk_chain.n_joints)
 
         # One-time torch.compile of hot-path functions.
         self._compile_hot_functions(device)
@@ -261,15 +276,15 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
     def _relative_pose9_to_absolute(
         self,
         rel_pose9: torch.Tensor,
-        episode_start_pose: torch.Tensor,
+        chunk_start_pose: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         rel_pose9: (B,T,9), relative to episode start EE frame.
-        episode_start_pose: (B,6), [xyz, axis-angle].
+        chunk_start_pose: (B,6), [xyz, axis-angle].
         returns abs_pos (B,T,3), abs_rot (B,T,3,3)
         """
-        base_pos = episode_start_pose[:, :3]
-        base_rot = axis_angle_to_matrix(episode_start_pose[:, 3:6])
+        base_pos = chunk_start_pose[:, :3]
+        base_rot = axis_angle_to_matrix(chunk_start_pose[:, 3:6])
 
         rel_pos = rel_pose9[..., :3]
         rel_rot = rot6d_to_matrix(rel_pose9[..., 3:])
@@ -282,10 +297,10 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         self,
         abs_pos: torch.Tensor,
         abs_rot: torch.Tensor,
-        episode_start_pose: torch.Tensor,
+        chunk_start_pose: torch.Tensor,
     ) -> torch.Tensor:
-        base_pos = episode_start_pose[:, :3]
-        base_rot = axis_angle_to_matrix(episode_start_pose[:, 3:6])
+        base_pos = chunk_start_pose[:, :3]
+        base_rot = axis_angle_to_matrix(chunk_start_pose[:, 3:6])
         base_rot_t = base_rot.transpose(-2, -1)
 
         rel_pos = (base_rot_t.unsqueeze(1) @ (abs_pos - base_pos.unsqueeze(1)).unsqueeze(-1)).squeeze(-1)
@@ -296,13 +311,13 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
     # ===========================
     # FK / IK / Jacobian helpers
     # ===========================
-    def _solve_start_joint_from_pose(self, episode_start_pose: torch.Tensor) -> torch.Tensor:
-        B = episode_start_pose.shape[0]
-        start_pos = episode_start_pose[:, :3]
-        start_rot = axis_angle_to_matrix(episode_start_pose[:, 3:6])
+    def _solve_start_joint_from_pose(self, chunk_start_pose: torch.Tensor) -> torch.Tensor:
+        B = chunk_start_pose.shape[0]
+        start_pos = chunk_start_pose[:, :3]
+        start_rot = axis_angle_to_matrix(chunk_start_pose[:, 3:6])
         start_quat = matrix_to_quaternion(start_rot)
 
-        seed = torch.zeros((B, self._robot_dof), device=episode_start_pose.device, dtype=episode_start_pose.dtype)
+        seed = torch.zeros((B, self._robot_dof), device=chunk_start_pose.device, dtype=chunk_start_pose.dtype)
         goal_pose = Pose(position=start_pos, quaternion=start_quat)
         with torch.enable_grad():
             ik_result = self._ik_solver.solve_batch(goal_pose, retract_config=seed)
@@ -459,22 +474,22 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         local_cond=None,
         global_cond=None,
         generator=None,
-        episode_start_pose: Optional[torch.Tensor] = None,
+        chunk_start_pose: Optional[torch.Tensor] = None,
         obstacle_info=[],
         current_joint_angles: Optional[torch.Tensor] = None,
         return_debug: bool = False,
         **kwargs,
     ):
-        if episode_start_pose is None:
-            raise ValueError("episode_start_pose is required for joint-space inference.")
+        if chunk_start_pose is None:
+            raise ValueError("chunk_start_pose is required for joint-space inference.")
 
         self._ensure_kinematics(condition_data.device)
 
-        # Pre-compute base coordinate frame from episode_start_pose (constant
+        # Pre-compute base coordinate frame from chunk_start_pose (constant
         # across denoising steps) to avoid ~33 redundant axis_angle_to_matrix
         # calls inside pose conversion helpers.
-        base_pos = episode_start_pose[:, :3]
-        base_rot = axis_angle_to_matrix(episode_start_pose[:, 3:6])
+        base_pos = chunk_start_pose[:, :3]
+        base_rot = axis_angle_to_matrix(chunk_start_pose[:, 3:6])
         base_rot_t = base_rot.transpose(-2, -1)
 
         model = self.model
@@ -484,7 +499,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
 
         # ── 1) Obtain starting joint configuration ──────────────────────
         if current_joint_angles is None:
-            q_start = self._solve_start_joint_from_pose(episode_start_pose)
+            q_start = self._solve_start_joint_from_pose(chunk_start_pose)
         else:
             q_start = current_joint_angles[..., : self._robot_dof].to(
                 device=condition_data.device, dtype=condition_data.dtype
@@ -681,7 +696,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
                 q_arm_dbg = q_traj[..., : self._robot_dof]
                 abs_p, abs_r = self._fk_to_absolute(q_arm_dbg)
                 rel9 = self._absolute_pose_to_relative9(
-                    abs_p, abs_r, episode_start_pose
+                    abs_p, abs_r, chunk_start_pose
                 )
                 cart_phys_after = torch.cat(
                     [rel9, q_traj[..., self._robot_dof : self._robot_dof + 1]],
@@ -722,7 +737,7 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
         obs_dict: Dict[str, torch.Tensor],
         fixed_action_prefix: torch.Tensor = None,
         env_batched=False,
-        episode_start_pose: torch.Tensor = None,
+        chunk_start_pose: torch.Tensor = None,
         obstacle_info=[],
         current_joint_angles: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -756,15 +771,15 @@ class DiffusionUnetTimmPolicyJointSpace(DiffusionUnetTimmPolicy):
             cond_mask[:, :n_fixed_steps] = True
             cond_data = self.normalizer["action"].normalize(cond_data)
 
-        if episode_start_pose is None:
-            raise ValueError("episode_start_pose must be provided for joint-space policy inference.")
+        if chunk_start_pose is None:
+            raise ValueError("chunk_start_pose must be provided for joint-space policy inference.")
 
         nsample = self.conditional_sample(
             condition_data=cond_data,
             condition_mask=cond_mask,
             local_cond=None,
             global_cond=global_cond,
-            episode_start_pose=episode_start_pose,
+            chunk_start_pose=chunk_start_pose,
             obstacle_info=obstacle_info,
             current_joint_angles=current_joint_angles,
             **self.kwargs,

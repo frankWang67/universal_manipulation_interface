@@ -54,6 +54,7 @@ class BimanualUmiEnv:
             # action
             max_pos_speed=0.25,
             max_rot_speed=0.6,
+            max_joint_speed=0.6,
             init_joints=False,
             # vis params
             enable_multi_cam_vis=True,
@@ -221,6 +222,7 @@ class BimanualUmiEnv:
                     gain=300,
                     max_pos_speed=max_pos_speed*cube_diag,
                     max_rot_speed=max_rot_speed*cube_diag,
+                    max_joint_speed=max_joint_speed,
                     launch_timeout=3,
                     tcp_offset_pose=[0, 0, rc['tcp_offset'], 0, 0, 0],
                     payload_mass=None,
@@ -275,6 +277,7 @@ class BimanualUmiEnv:
         self.max_obs_buffer_size = max_obs_buffer_size
         self.max_pos_speed = max_pos_speed
         self.max_rot_speed = max_rot_speed
+        self.max_joint_speed = max_joint_speed
         # timing
         self.camera_obs_latency = camera_obs_latency
         self.camera_down_sample_steps = camera_down_sample_steps
@@ -441,9 +444,19 @@ class BimanualUmiEnv:
                 t=last_robot_data['robot_timestamp'], 
                 x=last_robot_data['ActualTCPPose'])
             robot_pose = robot_pose_interpolator(robot_obs_timestamps)
+            joint_pos_interpolator = get_interp1d(
+                t=last_robot_data['robot_timestamp'],
+                x=last_robot_data['ActualQ']
+            )
+            joint_vel_interpolator = get_interp1d(
+                t=last_robot_data['robot_timestamp'],
+                x=last_robot_data['ActualQd']
+            )
             robot_obs = {
                 f'robot{robot_idx}_eef_pos': robot_pose[...,:3],
-                f'robot{robot_idx}_eef_rot_axis_angle': robot_pose[...,3:]
+                f'robot{robot_idx}_eef_rot_axis_angle': robot_pose[...,3:],
+                f'robot{robot_idx}_joint_pos': joint_pos_interpolator(robot_obs_timestamps),
+                f'robot{robot_idx}_joint_vel': joint_vel_interpolator(robot_obs_timestamps),
             }
             # update obs_data
             obs_data.update(robot_obs)
@@ -489,7 +502,8 @@ class BimanualUmiEnv:
     def exec_actions(self, 
             actions: np.ndarray, 
             timestamps: np.ndarray,
-            compensate_latency=False):
+            compensate_latency=False,
+            action_mode='eef'):
         assert self.is_ready
         if not isinstance(actions, np.ndarray):
             actions = np.array(actions)
@@ -502,24 +516,53 @@ class BimanualUmiEnv:
         new_actions = actions[is_new]
         new_timestamps = timestamps[is_new]
 
-        assert new_actions.shape[1] // len(self.robots) == 7
-        assert new_actions.shape[1] % len(self.robots) == 0
+        if action_mode == 'eef':
+            assert new_actions.shape[1] // len(self.robots) == 7
+            assert new_actions.shape[1] % len(self.robots) == 0
 
-        # schedule waypoints
-        for i in range(len(new_actions)):
-            for robot_idx, (robot, gripper, rc, gc) in enumerate(zip(self.robots, self.grippers, self.robots_config, self.grippers_config)):
-                r_latency = rc['robot_action_latency'] if compensate_latency else 0.0
-                g_latency = gc['gripper_action_latency'] if compensate_latency else 0.0
-                r_actions = new_actions[i, 7 * robot_idx + 0: 7 * robot_idx + 6]
-                g_actions = new_actions[i, 7 * robot_idx + 6]
-                robot.schedule_waypoint(
-                    pose=r_actions,
-                    target_time=new_timestamps[i] - r_latency
-                )
-                gripper.schedule_waypoint(
-                    pos=g_actions,
-                    target_time=new_timestamps[i] - g_latency
-                )
+            for i in range(len(new_actions)):
+                for robot_idx, (robot, gripper, rc, gc) in enumerate(zip(self.robots, self.grippers, self.robots_config, self.grippers_config)):
+                    r_latency = rc['robot_action_latency'] if compensate_latency else 0.0
+                    g_latency = gc['gripper_action_latency'] if compensate_latency else 0.0
+                    r_actions = new_actions[i, 7 * robot_idx + 0: 7 * robot_idx + 6]
+                    g_actions = new_actions[i, 7 * robot_idx + 6]
+                    robot.schedule_waypoint(
+                        pose=r_actions,
+                        target_time=new_timestamps[i] - r_latency
+                    )
+                    gripper.schedule_waypoint(
+                        pos=g_actions,
+                        target_time=new_timestamps[i] - g_latency
+                    )
+        elif action_mode == 'joint':
+            for robot in self.robots:
+                if not hasattr(robot, 'schedule_joint_waypoint'):
+                    raise NotImplementedError(
+                        f"Robot controller {type(robot).__name__} does not support joint-space waypoints."
+                    )
+            expected_action_dim = 0
+            for robot in self.robots:
+                expected_action_dim += int(np.asarray(robot.get_state()['ActualQ']).shape[0]) + 1
+            assert new_actions.shape[1] == expected_action_dim
+            for i in range(len(new_actions)):
+                action_offset = 0
+                for robot_idx, (robot, gripper, rc, gc) in enumerate(zip(self.robots, self.grippers, self.robots_config, self.grippers_config)):
+                    r_latency = rc['robot_action_latency'] if compensate_latency else 0.0
+                    g_latency = gc['gripper_action_latency'] if compensate_latency else 0.0
+                    joint_dim = int(np.asarray(robot.get_state()['ActualQ']).shape[0])
+                    r_actions = new_actions[i, action_offset: action_offset + joint_dim]
+                    g_actions = new_actions[i, action_offset + joint_dim]
+                    robot.schedule_joint_waypoint(
+                        joints=r_actions,
+                        target_time=new_timestamps[i] - r_latency
+                    )
+                    gripper.schedule_waypoint(
+                        pos=g_actions,
+                        target_time=new_timestamps[i] - g_latency
+                    )
+                    action_offset += joint_dim + 1
+        else:
+            raise ValueError(f"Unknown action_mode: {action_mode}")
 
         # record actions
         if self.action_accumulator is not None:

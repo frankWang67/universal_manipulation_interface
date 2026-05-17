@@ -37,13 +37,13 @@ class DiffusionUnetTimmPolicyWithGuidance(DiffusionUnetTimmPolicy):
         local_cond=None,
         global_cond=None,
         generator=None,
-        episode_start_pose=None,
+        chunk_start_pose=None,
         obstacle_info=[],
         current_joint_angles=None,
         # keyword arguments to scheduler.step
         **kwargs
     ):
-        assert episode_start_pose is not None, "episode_start_pose is required for guided diffusion"
+        assert chunk_start_pose is not None, "chunk_start_pose is required for guided diffusion"
 
         model = self.model
         scheduler = self.noise_scheduler
@@ -87,7 +87,7 @@ class DiffusionUnetTimmPolicyWithGuidance(DiffusionUnetTimmPolicy):
                 # 计算 Loss
                 loss = rel_action_obstacle_loss(
                     action_pred=x_physical, 
-                    current_state=episode_start_pose, # 传入当前的真实机器人状态
+                    current_state=chunk_start_pose, # 传入当前的真实机器人状态
                     robot_corners=self.eef_corner_pts,
                     obstacles=obstacle_info,
                 )
