@@ -57,7 +57,8 @@ def main(session_dir):
             cmd = [
                 'python', str(script_path),
                 '--input', str(tag_path),
-                '--output', str(gripper_range_path)
+                '--output', str(gripper_range_path),
+                '--tag_det_threshold', '0.6',
             ]
             subprocess.run(cmd)
 

@@ -283,7 +283,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
     # output: 
     # add video_meta_df['gripper_hardware_id'] column
     # cam_serial_gripper_hardware_id_map Dict[str, int]
-    finger_tag_det_th = 0.8
+    finger_tag_det_th = 0.6
     vid_idx_gripper_hardware_id_map = dict()
     cam_serial_gripper_ids_map = collections.defaultdict(list)
     for vid_idx, row in video_meta_df.iterrows():
