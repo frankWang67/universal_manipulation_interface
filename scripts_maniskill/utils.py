@@ -388,7 +388,7 @@ def evaluate(
             result = policy.predict_action(
                 obs_dict, 
                 env_batched=False, 
-                episode_start_pose=episode_start_pose_tensor, 
+                chunk_start_pose=episode_start_pose_tensor, 
                 obstacle_info=obstacle_info, 
                 current_joint_angles=current_joint_angles,
             )

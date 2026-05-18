@@ -282,7 +282,7 @@ def main(
             episode_start_pose_tensor = torch.from_numpy(episode_start_pose[0]).to(device)
         else:
             episode_start_pose_tensor = None
-        result = policy.predict_action(obs_dict, env_batched=False, episode_start_pose=episode_start_pose_tensor)
+        result = policy.predict_action(obs_dict, env_batched=False, chunk_start_pose=episode_start_pose_tensor)
         if control_mode.startswith("pd_joint"):
             action = result["joint_action_pred"].detach().to("cpu").numpy()
             single_action_space = getattr(env, "single_action_space", env.action_space)
