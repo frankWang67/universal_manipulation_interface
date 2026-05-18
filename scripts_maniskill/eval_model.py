@@ -223,9 +223,11 @@ def main(
         render_mode=render_mode,
         max_episode_steps=max_episode_steps,
         sensor_configs=dict(shader_pack="default"),
+        reward_mode="normalized_dense",
     )
     if harder or add_guidance or joint_space_guidance:
         env_kwargs['harder'] = True
+    track_collisions = harder or joint_space_guidance
     other_kwargs = dict(obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon)
     env = make_eval_envs(
         env_id,
@@ -235,6 +237,7 @@ def main(
         other_kwargs,
         video_dir=video_dir,
         wrappers=[FlattenRGBDObservationWrapper],
+        track_collisions=track_collisions,
     )
 
     # creating model
@@ -302,10 +305,41 @@ def main(
         control_mode=control_mode,
     )
     print("Evaluation results over {} episodes:".format(num_eval_episodes))
-    success_once_rate = np.mean(eval_metrics["success_once"])
-    success_at_end_rate = np.mean(eval_metrics["success_at_end"])
+    success_once_rate = float(np.mean(eval_metrics["success_once"]))
+    success_at_end_rate = float(np.mean(eval_metrics["success_at_end"]))
     print(f"{success_once_rate=}")
     print(f"{success_at_end_rate=}")
+
+    # ---- collisions ----
+    if "collision_count" in eval_metrics:
+        avg_collision = float(np.mean(eval_metrics["collision_count"]))
+        std_collision = float(np.std(eval_metrics["collision_count"]))
+        print(f"avg collisions/ep: {avg_collision:.2f}  std: {std_collision:.2f}")
+    else:
+        avg_collision = None
+        std_collision = None
+
+    # ---- max reward ----
+    if "max_reward" in eval_metrics:
+        avg_max_reward = float(np.mean(eval_metrics["max_reward"]))
+        std_max_reward = float(np.std(eval_metrics["max_reward"]))
+        print(f"avg max reward/ep: {avg_max_reward:.4f}  std: {std_max_reward:.4f}")
+    else:
+        avg_max_reward = None
+        std_max_reward = None
+
+    # ---- fail rate among non-success episodes ----
+    if "fail_once" in eval_metrics:
+        success_once = eval_metrics["success_once"]
+        fail_once = eval_metrics["fail_once"]
+        non_success_mask = success_once == 0
+        if non_success_mask.sum() > 0:
+            fail_rate_among_non_success = float(fail_once[non_success_mask].mean())
+        else:
+            fail_rate_among_non_success = -1.0  # all episodes succeeded
+        print(f"fail rate among non-success episodes: {fail_rate_among_non_success}")
+    else:
+        fail_rate_among_non_success = None
 
     log_dir = os.path.join(exp_path, 'eval_results', robot_uids)
     if joint_space_guidance:
@@ -315,9 +349,29 @@ def main(
     elif harder:
         log_dir = os.path.join(log_dir, 'without_guidance')
     log_filename = os.path.join(log_dir, 'eval_results.txt')
-    with open(log_filename, "a") as f:
-        f.write(f"Success Once Rate: {success_once_rate}\n")
-        f.write(f"Success At End Rate: {success_at_end_rate}\n")
+    os.makedirs(os.path.dirname(log_filename), exist_ok=True)
+    with open(log_filename, "w") as f:
+        f.write(f"success_once_rate: {success_once_rate}\n")
+        f.write(f"success_at_end_rate: {success_at_end_rate}\n")
+
+        if avg_collision is not None:
+            f.write(f"avg_collision_per_episode: {avg_collision}\n")
+            f.write(f"std_collision_per_episode: {std_collision}\n")
+        else:
+            f.write("avg_collision_per_episode: N/A\n")
+            f.write("std_collision_per_episode: N/A\n")
+
+        if avg_max_reward is not None:
+            f.write(f"avg_max_reward_per_episode: {avg_max_reward}\n")
+            f.write(f"std_max_reward_per_episode: {std_max_reward}\n")
+        else:
+            f.write("avg_max_reward_per_episode: N/A\n")
+            f.write("std_max_reward_per_episode: N/A\n")
+
+        if fail_rate_among_non_success is not None:
+            f.write(f"fail_rate_among_non_success: {fail_rate_among_non_success}\n")
+        else:
+            f.write("fail_rate_among_non_success: N/A\n")
 
 # %%
 if __name__ == '__main__':

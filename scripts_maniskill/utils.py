@@ -31,6 +31,75 @@ class AgentPoseWrapper(gym.Wrapper):
         T_from_world_to_robot = self.unwrapped.agent.get_state()["robot_root_pose"].inv().to_transformation_matrix()
         return T_from_world_to_robot
 
+class CollisionTrackerWrapper(gym.Wrapper):
+    """Tracks robot-obstacle collisions and per-episode max reward.
+
+    Uses ``scene.get_pairwise_contact_forces(link, obstacle)`` to detect collisions
+    between every robot link and every obstacle actor returned by the environment's
+    ``get_obstacle_actors()`` method.  A contact force magnitude above the threshold
+    is counted as one collision for that step.
+
+    Also tracks the maximum step reward observed during each episode.
+
+    Metrics are written into ``info["episode"]`` on every step so they appear in
+    ``final_info`` at episode end.
+    """
+
+    FORCE_THRESHOLD = 1e-2
+
+    def __init__(self, env):
+        super().__init__(env)
+        self._episode_collision_count = 0
+        self._episode_max_reward = -float("inf")
+
+    def _get_obstacle_actors(self):
+        base_env = self.unwrapped
+        if hasattr(base_env, "get_obstacle_actors"):
+            return base_env.get_obstacle_actors()
+        return []
+
+    def _get_robot_links(self):
+        return list(self.unwrapped.agent.robot.get_links())
+
+    def reset(self, **kwargs):
+        self._episode_collision_count = 0
+        self._episode_max_reward = -float("inf")
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        obstacle_actors = self._get_obstacle_actors()
+        if obstacle_actors:
+            scene = self.unwrapped.scene
+            robot_links = self._get_robot_links()
+            step_collided = False
+            for obstacle in obstacle_actors:
+                for link in robot_links:
+                    contact_force = scene.get_pairwise_contact_forces(link, obstacle)
+                    force_mag = float(torch.linalg.norm(contact_force, dim=-1).max())
+                    if force_mag > self.FORCE_THRESHOLD:
+                        step_collided = True
+                        break
+                if step_collided:
+                    break
+            self._episode_collision_count += int(step_collided)
+
+        # Track max reward for this episode
+        try:
+            r = float(reward)
+        except (TypeError, ValueError):
+            r = -float("inf")
+        if r > self._episode_max_reward:
+            self._episode_max_reward = r
+
+        if "episode" in info:
+            info["episode"]["collision_count"] = self._episode_collision_count
+            info["episode"]["max_reward"] = self._episode_max_reward
+
+        return obs, reward, terminated, truncated, info
+
+
 def make_eval_envs(
     env_id,
     num_envs: int,
@@ -39,6 +108,7 @@ def make_eval_envs(
     other_kwargs: dict,
     video_dir: Optional[str] = None,
     wrappers: list[gym.Wrapper] = [],
+    track_collisions: bool = False,
 ):
     """Create vectorized environment for evaluation and/or recording videos.
     For CPU vectorized environments only the first parallel environment is used to record videos.
@@ -73,6 +143,8 @@ def make_eval_envs(
                         source_desc="diffusion_policy evaluation rollout",
                     )
                 env = AgentPoseWrapper(env)
+                if track_collisions:
+                    env = CollisionTrackerWrapper(env)
                 env.action_space.seed(seed)
                 env.observation_space.seed(seed)
 
@@ -342,7 +414,7 @@ def evaluate(
                 action_seq = get_maniskill_umi_action(raw_action, obs, action_pose_repr, batched=True)
 
             for i in range(steps_per_inference):
-                obs, rew, terminated, truncated, info = eval_envs.step(action_seq[:, i])
+                obs, reward, terminated, truncated, info = eval_envs.step(action_seq[:, i])
                 if truncated.any():
                     break
             current_joint_angles = torch.tensor(obs["joint_state"][:, -1, :])
@@ -374,4 +446,8 @@ def evaluate(
     eval_metrics['inference_frequency'] = np.array([frequency])
     print(f"Inference calls: {inference_call_count}, total time: {inference_time_total:.4f}s, frequency: {frequency:.2f} calls/s")
     # ======== END ADDED: INFERENCE STATISTICS (OUTPUT) ========
+
+    if "collision_count" in eval_metrics:
+        avg_collision = float(np.mean(eval_metrics["collision_count"]))
+        print(f"Average collisions per episode: {avg_collision:.2f}")
     return eval_metrics

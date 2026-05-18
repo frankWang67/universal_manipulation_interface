@@ -380,7 +380,8 @@ class DiffusionUnetTimmPolicyJointSpaceWithGuidance(DiffusionUnetTimmPolicyJoint
         # If any of the top-k spheres is already penetrating the obstacle
         # (max_val > 0), preserve that positive sign exactly instead of
         # averaging it away with nearby negative spheres.
-        return torch.where(max_val > 0, max_val, smooth_topk)
+        # return torch.where(max_val > 0, max_val, smooth_topk)
+        return smooth_topk
 
     def _compute_cbf_linearization(
         self, q_arm: torch.Tensor
